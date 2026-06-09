@@ -187,7 +187,7 @@ int ve2_create_coredump(struct amdxdna_dev *xdna, struct amdxdna_ctx *hwctx,
  * Returns 0 on success or a negative error code.
  */
 
-int ve2_mgmt_destroy_partition(struct amdxdna_ctx *hwctx);
+void ve2_mgmt_destroy_partition(struct amdxdna_mgmtctx *mgmtctx);
 /**
  * ve2_get_hwctx - Retrieve the hardware context for a given column.
  * @xdna: Pointer to the device structure.
@@ -218,6 +218,15 @@ int notify_fw_cmd_ready(struct amdxdna_ctx *hwctx);
  * Returns 0 on success or a negative error code.
  */
 int ve2_xrs_request(struct amdxdna_dev *xdna, struct amdxdna_ctx *hwctx);
+
+/**
+ * ve2_xrs_release - Release XRS resources for a context.
+ * @xdna: Pointer to the device structure.
+ * @hwctx: Pointer to the hardware context.
+ *
+ * Returns 0 on success or a negative error code.
+ */
+int ve2_xrs_release(struct amdxdna_dev *xdna, struct amdxdna_ctx *hwctx);
 
 /**
  * ve2_mgmt_schedule_cmd - Schedule a command for execution.

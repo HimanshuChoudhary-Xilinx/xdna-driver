@@ -1416,27 +1416,23 @@ int ve2_hwctx_init(struct amdxdna_ctx *hwctx)
 	struct amdxdna_client *client = hwctx->client;
 	struct amdxdna_dev *xdna = client->xdna;
 	struct amdxdna_ctx_priv *priv = NULL;
+	u32 hwctx_id;
 	int ret;
 
 	priv = kzalloc(sizeof(*priv), GFP_KERNEL);
 	if (!priv)
 		return -ENOMEM;
 
+        /* Allocate unique ID using XArray (thread-safe, supports ID recycling) */
+        ret = xa_alloc_cyclic(&xdna->dev_handle->hwctx_ids, &hwctx_id, priv,
+                        XA_LIMIT(1, U32_MAX),
+                        &xdna->dev_handle->next_hwctx_id, GFP_KERNEL);
+        if (ret < 0) {
+                XDNA_ERR(xdna, "Failed to allocate hwctx ID, ret=%d", ret);
+                goto cleanup_priv;
+        }
+        priv->id = hwctx_id;
 	hwctx->priv = priv;
-
-	/* Allocate unique ID using XArray (thread-safe, supports ID recycling) */
-	{
-		u32 hwctx_id;
-
-		ret = xa_alloc_cyclic(&xdna->dev_handle->hwctx_ids, &hwctx_id, priv,
-				      XA_LIMIT(1, U32_MAX),
-				      &xdna->dev_handle->next_hwctx_id, GFP_KERNEL);
-		if (ret < 0) {
-			XDNA_ERR(xdna, "Failed to allocate hwctx ID, ret=%d", ret);
-			goto cleanup_priv;
-		}
-		priv->id = hwctx_id;
-	}
 
 	trace_amdxdna_trace_point("XRT_PROFILING_TRACE_ENTER",
 				  client->pid, 0, priv->id, 0);
@@ -1482,7 +1478,7 @@ int ve2_hwctx_init(struct amdxdna_ctx *hwctx)
 
 cleanup_xrs:
 	/* Releases XRS and partition (ve2_mgmt_destroy_partition calls ve2_xrs_release). */
-	ve2_mgmt_destroy_partition(hwctx);
+	ve2_xrs_release(xdna, hwctx);
 cleanup_priv:
 	kfree(hwctx->priv);
 	hwctx->priv = NULL;
@@ -1555,7 +1551,7 @@ void ve2_hwctx_fini(struct amdxdna_ctx *hwctx)
 	if (verbosity >= VERBOSITY_LEVEL_DBG)
 		ve2_get_firmware_status(hwctx);
 
-	ve2_mgmt_destroy_partition(hwctx);
+	ve2_xrs_release(xdna, hwctx);
 	ve2_free_hsa_queue(xdna, &hwctx->priv->hwctx_hsa_queue);
 	kfree(hwctx->priv->hwctx_config);
 	mutex_destroy(&hwctx->priv->privctx_lock);

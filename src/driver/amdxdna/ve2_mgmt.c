@@ -19,8 +19,7 @@ static int aie_error_delay_sec;
 module_param(aie_error_delay_sec, int, 0644);
 MODULE_PARM_DESC(aie_error_delay_sec, "Delay in seconds on AIE error before waking threads (for devmem debug, default=0)");
 
-static int ve2_create_mgmt_partition(struct amdxdna_dev *xdna,
-				     struct amdxdna_ctx *hwctx,
+static struct amdxdna_mgmtctx *ve2_create_mgmt_partition(struct amdxdna_dev *xdna,
 				     struct xrs_action_load *load_act);
 
 static void cert_setup_partition(struct amdxdna_dev *xdna,
@@ -170,6 +169,7 @@ int ve2_xrs_col_list(struct amdxdna_dev *xdna, struct alloc_requests *xrs_req,
 int ve2_xrs_request(struct amdxdna_dev *xdna, struct amdxdna_ctx *hwctx)
 {
 	struct solver_state *xrs = xdna->dev_handle->xrs_hdl;
+        struct amdxdna_mgmtctx  *mgmtctx = NULL;
 	struct xrs_action_load load_act = {0};
 	struct amdxdna_ctx_priv *nhwctx = NULL;
 	struct alloc_requests *xrs_req;
@@ -233,16 +233,18 @@ int ve2_xrs_request(struct amdxdna_dev *xdna, struct amdxdna_ctx *hwctx)
 		goto free_start_cols;
 	}
 
-	ret = ve2_create_mgmt_partition(xdna, hwctx, &load_act);
-	if (ret) {
+	mgmtctx = ve2_create_mgmt_partition(xdna, &load_act);
+	if (!mgmtctx) {
 		XDNA_ERR(xdna, "Creating AIE partition failed, ret %d", ret);
 		mutex_unlock(&xrs->xrs_lock);
 		goto xrs_release;
 	}
 
 	nhwctx = hwctx->priv;
-	hwctx->start_col = nhwctx->start_col;
-	hwctx->num_col = nhwctx->num_col;
+        nhwctx->start_col = mgmtctx->start_col;
+        nhwctx->num_col = mgmtctx->ncol;
+	nhwctx->aie_dev = mgmtctx->mgmt_aiedev;
+	nhwctx->args = &mgmtctx->args;
 	/* Allocate hwctx_config array based on number of columns for this context */
 	nhwctx->hwctx_config = kcalloc(nhwctx->num_col,
 				       sizeof(*nhwctx->hwctx_config), GFP_KERNEL);
@@ -252,6 +254,9 @@ int ve2_xrs_request(struct amdxdna_dev *xdna, struct amdxdna_ctx *hwctx)
 		ret = -ENOMEM;
 		goto destroy_partition;
 	}
+	
+        hwctx->start_col = nhwctx->start_col;
+	hwctx->num_col = nhwctx->num_col;
 	mutex_unlock(&xrs->xrs_lock);
 
 	kfree(xrs_req->cdo.start_cols);
@@ -259,7 +264,7 @@ int ve2_xrs_request(struct amdxdna_dev *xdna, struct amdxdna_ctx *hwctx)
 	return 0;
 
 destroy_partition:
-	ve2_mgmt_destroy_partition(hwctx);
+	ve2_mgmt_destroy_partition(mgmtctx);
 xrs_release:
 	xrs_release_resource(xrs, (uintptr_t)hwctx, &load_act);
 free_start_cols:
@@ -1187,18 +1192,16 @@ static void ve2_aie_error_cb(void *arg)
 /**
  * ve2_create_mgmt_partition - Create and initialize a management partition for VE2 device
  * @xdna: Pointer to the AMD XDNA device structure
- * @hwctx: Pointer to the hardware context structure
  * @load_act: Pointer to the XRS action load structure containing partition info
  *
  * This function sets up the management context, requests the AIE partition if needed,
  * initializes workqueues for command scheduling, and updates context pointers.
  * Returns 0 on success or a negative error code on failure.
  */
-static int ve2_create_mgmt_partition(struct amdxdna_dev *xdna,
-				     struct amdxdna_ctx *hwctx,
-				     struct xrs_action_load *load_act)
+static struct amdxdna_mgmtctx *
+ve2_create_mgmt_partition(struct amdxdna_dev *xdna,
+                         struct xrs_action_load *load_act)
 {
-	struct amdxdna_ctx_priv *nhwctx = hwctx->priv;
 	struct aie_partition_req request = { 0 };
 	u32 start_col = load_act->part.start_col;
 	struct amdxdna_mgmtctx  *mgmtctx =
@@ -1215,16 +1218,15 @@ static int ve2_create_mgmt_partition(struct amdxdna_dev *xdna,
 		if (IS_ERR(mgmtctx->mgmt_aiedev)) {
 			XDNA_ERR(xdna, "aie partition request failed for part id %d",
 				 request.partition_id);
-			return -ENODEV;
+			return NULL;
 		}
 
 		mgmtctx->xdna = xdna;
 		mgmtctx->mgmt_partid = request.partition_id;
 		mgmtctx->start_col = load_act->part.start_col;
+		mgmtctx->ncol = load_act->part.ncols;
 		mgmtctx->args.locs = NULL;
 		mgmtctx->args.num_tiles = 0;
-		nhwctx->args = &mgmtctx->args;
-		nhwctx->aie_dev = mgmtctx->mgmt_aiedev;
 		mutex_init(&mgmtctx->ctx_lock);
 		mutex_init(&mgmtctx->async_errs_cache.lock);
 		memset(&mgmtctx->async_errs_cache.err, 0, sizeof(mgmtctx->async_errs_cache.err));
@@ -1236,20 +1238,16 @@ static int ve2_create_mgmt_partition(struct amdxdna_dev *xdna,
 		if (!mgmtctx->mgmtctx_workq) {
 			XDNA_ERR(xdna, "Failed to create Workqueue for scheduler");
 			aie_partition_release(mgmtctx->mgmt_aiedev);
-			return -ENOMEM;
+			return NULL;
 		}
+
 		INIT_WORK(&mgmtctx->sched_work, ve2_scheduler_work);
 		/* Register AIE error call back function. */
-		ret = aie_register_error_notification(nhwctx->aie_dev, ve2_aie_error_cb, mgmtctx);
+		ret = aie_register_error_notification(mgmtctx->mgmt_aiedev, ve2_aie_error_cb, mgmtctx);
 		XDNA_DBG(xdna, "Registered AIE error call back function, ret : %d\n", ret);
-	} else {
-		nhwctx->aie_dev = mgmtctx->mgmt_aiedev;
-		nhwctx->args = &mgmtctx->args;
 	}
 
-	nhwctx->start_col = load_act->part.start_col;
-	nhwctx->num_col = load_act->part.ncols;
-	return 0;
+	return mgmtctx;
 }
 
 // we split ve2_partition_read into multiple call for mem and core tile till aie driver provide
@@ -1289,12 +1287,6 @@ int ve2_create_coredump(struct amdxdna_dev *xdna,
 	return rel_size;
 }
 
-static int ve2_xrs_release(struct amdxdna_dev *xdna, struct amdxdna_ctx *hwctx,
-			   struct xrs_action_load *load_act)
-{
-	return xrs_release_resource(xdna->dev_handle->xrs_hdl, (uintptr_t)hwctx, load_act);
-}
-
 static void cert_clear_partition(struct amdxdna_dev *xdna, struct amdxdna_ctx_priv *nhwctx)
 {
 	struct device *aie_dev = nhwctx->aie_dev;
@@ -1314,66 +1306,63 @@ static void cert_clear_partition(struct amdxdna_dev *xdna, struct amdxdna_ctx_pr
 	ve2_free_hs_data(hs_data, num_col);
 }
 
+int ve2_xrs_release(struct amdxdna_dev *xdna, struct amdxdna_ctx *hwctx)
+{
+        struct solver_state *xrs = xdna->dev_handle->xrs_hdl;
+        struct amdxdna_ctx_priv *nhwctx = hwctx->priv;
+        struct amdxdna_mgmtctx  *mgmtctx = NULL;
+        u32 start_col = nhwctx->start_col;
+        struct xrs_action_load load_act;
+        int ret;
+
+        mutex_lock(&xrs->xrs_lock);
+	ret = xrs_release_resource(xdna->dev_handle->xrs_hdl, (uintptr_t)hwctx, &load_act);
+        mutex_unlock(&xrs->xrs_lock);
+        if (ret)
+                return ret;
+
+        mgmtctx = &xdna->dev_handle->ve2_mgmtctx[start_col];
+        if (load_act.release_aie_part) {
+                cert_clear_partition(xdna, nhwctx);
+                ve2_mgmt_destroy_partition(mgmtctx);
+        } else {
+                mutex_lock(&mgmtctx->ctx_lock);
+                if (mgmtctx->active_ctx == hwctx)
+                        mgmtctx->active_ctx = NULL;
+                mutex_unlock(&mgmtctx->ctx_lock);
+        }
+
+        return 0;
+}
+
 /**
  * ve2_mgmt_destroy_partition - Destroys a VE2 management partition and releases
  *                              associated resources.
- * @hwctx: Pointer to the hardware context to be destroyed.
+ * @mgmtctx: Pointer to the Management context to be destroyed.
  *
- * This function releases the XRS resource, clears the partition handshake memory,
- * tears down and releases the AIE partition, and updates the management context state.
+ * This function tearsdown and releases the AIE partition, and updates the management context.
  * It should be called when a hardware context is no longer needed.
  */
-int ve2_mgmt_destroy_partition(struct amdxdna_ctx *hwctx)
+void ve2_mgmt_destroy_partition(struct amdxdna_mgmtctx  *mgmtctx)
 {
-	struct amdxdna_dev *xdna = hwctx->client->xdna;
-	struct amdxdna_ctx_priv *nhwctx = hwctx->priv;
-	struct amdxdna_mgmtctx  *mgmtctx = NULL;
-	u32 start_col = nhwctx->start_col;
-	struct xrs_action_load load_act;
-	struct solver_state *xrs = xdna->dev_handle->xrs_hdl;
-	int ret;
+        struct amdxdna_dev *xdna = mgmtctx->xdna;
+        struct workqueue_struct *wq = NULL;
 
-	if (!nhwctx->aie_dev) {
-		XDNA_ERR(xdna, "Partition does not have aie device handle");
-		return -ENODEV;
-	}
+        mutex_lock(&mgmtctx->ctx_lock);
+        /* Update the active context as partition doesn't exists any more */
+        mgmtctx->mgmtctx_workq = NULL;
+        mgmtctx->active_ctx = NULL;
+        wq = mgmtctx->mgmtctx_workq;
+        mutex_unlock(&mgmtctx->ctx_lock);
 
-	mutex_lock(&xrs->xrs_lock);
-	ret = ve2_xrs_release(xdna, hwctx, &load_act);
-	if (ret) {
-		XDNA_ERR(xdna, "XRS Release failed ret %d", ret);
-		goto unlock_xrs_lock;
-	}
+        if (wq)
+                destroy_workqueue(wq);
 
-	mgmtctx = &xdna->dev_handle->ve2_mgmtctx[start_col];
-	if (load_act.release_aie_part) {
-		struct workqueue_struct *wq = NULL;
+        aie_unregister_error_notification(mgmtctx->mgmt_aiedev);
 
-		cert_clear_partition(xdna, nhwctx);
-		mutex_lock(&mgmtctx->ctx_lock);
-		/* Update the active context as partition doesn't exists any more */
-		mgmtctx->active_ctx = NULL;
-		wq = mgmtctx->mgmtctx_workq;
-		mgmtctx->mgmtctx_workq = NULL;
-
-		mutex_unlock(&mgmtctx->ctx_lock);
-
-		if (wq)
-			destroy_workqueue(wq);
-		aie_unregister_error_notification(nhwctx->aie_dev);
-		XDNA_DBG(xdna, "%s: Un-registered ve2_aie_error_cb() callback\n", __func__);
-		aie_partition_teardown(nhwctx->aie_dev);
-		aie_partition_release(nhwctx->aie_dev);
-	} else {
-		mutex_lock(&mgmtctx->ctx_lock);
-		if (mgmtctx->active_ctx == hwctx)
-			mgmtctx->active_ctx = NULL;
-		mutex_unlock(&mgmtctx->ctx_lock);
-	}
-
-unlock_xrs_lock:
-	mutex_unlock(&xrs->xrs_lock);
-	return ret;
+        XDNA_DBG(xdna, "%s: Un-registered ve2_aie_error_cb() callback\n", __func__);
+        aie_partition_teardown(mgmtctx->mgmt_aiedev);
+        aie_partition_release(mgmtctx->mgmt_aiedev);
 }
 
 struct amdxdna_ctx *ve2_get_hwctx(struct amdxdna_dev *xdna, u32 col)

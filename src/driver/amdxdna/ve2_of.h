@@ -110,6 +110,7 @@ struct amdxdna_mgmtctx {
 	struct amdxdna_ctx		*active_ctx;
 	struct device			*mgmt_aiedev;
 	u32				start_col;
+	u32				ncol;
 	u32				mgmt_partid;
 	struct aie_partition_init_args	args;
 	struct list_head		ctx_command_fifo_head;
