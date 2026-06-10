@@ -819,7 +819,7 @@ static int ve2_get_aie_part_fd(struct amdxdna_client *client,
 
 		/* Override to 36 columns (full device) for applications that expect full partition */
 		ctx->num_tiles = 36;
-
+		ctx->qos.user_start_col = 0;
 		ret = ve2_xrs_request(xdna, ctx);
 		if (ret) {
 			/* Restore original value on failure */
