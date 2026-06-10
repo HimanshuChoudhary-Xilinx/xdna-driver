@@ -801,9 +801,39 @@ static int ve2_get_aie_part_fd(struct amdxdna_client *client,
 		goto unlock;
 	}
 
+	/* HACK : SAIF TODO. Please Fix this */
 	nhwctx = ctx->priv;
-	if (!nhwctx || !nhwctx->aie_dev) {
-		XDNA_ERR(xdna, "AIE partition not available for hwctx_id=%u (pid=%u)",
+	if (!nhwctx) {
+		XDNA_ERR(xdna, "Invalid hwctx for hwctx_id=%u (pid=%u)",
+			 ctx->id, ctx->client->pid);
+		ret = -EINVAL;
+		goto unlock;
+	}
+
+	/* For dynamic scheduler: allocate partition on-demand if not already assigned */
+	if (!nhwctx->mgmtctx) {
+		u32 orig_num_tiles = ctx->num_tiles;
+
+		XDNA_DBG(xdna, "aie_part_fd: allocating 36-col partition hwctx_id=%u pid=%u",
+			 ctx->id, ctx->client->pid);
+
+		/* Override to 36 columns (full device) for applications that expect full partition */
+		ctx->num_tiles = 36;
+
+		ret = ve2_xrs_request(xdna, ctx);
+		if (ret) {
+			/* Restore original value on failure */
+			ctx->num_tiles = orig_num_tiles;
+			XDNA_ERR(xdna, "Failed to allocate partition hwctx_id=%u: %d",
+				 ctx->id, ret);
+			goto unlock;
+		}
+		/* Auto-select memory bitmap after partition allocation */
+		ve2_auto_select_mem_bitmap(xdna, ctx);
+	}
+
+	if (!nhwctx->aie_dev) {
+		XDNA_ERR(xdna, "AIE partition device not available for hwctx_id=%u (pid=%u)",
 			 ctx->id, ctx->client->pid);
 		ret = -ENODEV;
 		goto unlock;

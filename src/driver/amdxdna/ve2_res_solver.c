@@ -48,18 +48,21 @@ static void remove_partition_node(struct solver_rgroup *rgp, struct partition_no
 				  struct xrs_action_load *action)
 {
 	pt_node->nshared--;
-	if (pt_node->nshared > 0) {
-		action->release_aie_part = false;
-		return;
-	}
 
-	list_del(&pt_node->list);
+	/* For lazy reclamation: keep partition node alive even when nshared reaches 0.
+	 * Partition will be destroyed only during explicit reclaim operations.
+	 *
+	 * IMPORTANT: Keep bitmap SET even when nshared=0!
+	 * Reason: AIE partition physically exists and occupies these columns.
+	 * Clearing bitmap would cause XRS to create duplicate partition_nodes.
+	 *
+	 * To use these columns for different partition size, must explicitly
+	 * reclaim via ve2_xrs_reclaim_partition().
+	 */
+	action->release_aie_part = false;
 
-	rgp->npartition_node--;
-	bitmap_clear(rgp->resbit, pt_node->start_col, pt_node->ncols);
-
-	kfree(pt_node);
-	action->release_aie_part = true;
+	/* partition_node stays in list, bitmap stays set */
+	/* Both will be cleaned up during explicit reclaim */
 }
 
 static void remove_solver_node(struct solver_rgroup *rgp, struct solver_node *node,
@@ -363,10 +366,11 @@ static int allocate_partition_shared(struct solver_state *xrs,
 		return -ENODEV;
 	}
 
+	/* Reusing partition: increment nshared (bitmap already set) */
 	least_used->nshared++;
 	snode->pt_node = least_used;
-	drm_dbg(xrs->cfg.ddev, "Reused shared partition at col=%u (nshared now %u)\n",
-		least_used->start_col, least_used->nshared);
+	drm_dbg(xrs->cfg.ddev, "Reused shared partition at col=%u (nshared %u→%u)\n",
+		least_used->start_col, least_used->nshared - 1, least_used->nshared);
 
 	return 0;
 }
@@ -441,6 +445,107 @@ int xrs_release_resource(void *hdl, u64 rid, struct xrs_action_load *action)
 	remove_solver_node(&xrs->rgp, node, action);
 
 	return 0;
+}
+
+/*
+ * xrs_reclaim_partition() - Explicitly reclaim/destroy an idle partition
+ *
+ * @hdl:	Resource solver handle
+ * @start_col:	Starting column of partition to reclaim
+ * @ncols:	Number of columns in partition
+ * @action:	Output action (will set release_aie_part=true)
+ *
+ * Return:	0 when successful, error code otherwise
+ *
+ * This is used for lazy reclamation - partitions are kept alive when released,
+ * and only destroyed when we need to reclaim space for new allocations.
+ */
+/**
+ * xrs_get_partition_nshared - Get the nshared count for a partition
+ * @hdl: XRS handle
+ * @start_col: Starting column of partition
+ * @ncols: Number of columns in partition
+ *
+ * Returns: nshared count if partition exists, -ENOENT if not found
+ *
+ * This is used to check if a partition is idle (nshared == 0) without
+ * requiring knowledge of the XRS internal structures.
+ */
+int xrs_get_partition_nshared(void *hdl, u32 start_col, u32 ncols)
+{
+	struct solver_state *xrs = hdl;
+	struct solver_rgroup *rgp = &xrs->rgp;
+	struct partition_node *pt_node;
+
+	/* Find the partition node */
+	list_for_each_entry(pt_node, &rgp->pt_node_list, list) {
+		if (pt_node->start_col == start_col && pt_node->ncols == ncols) {
+			return pt_node->nshared;
+		}
+	}
+
+	return -ENOENT;
+}
+
+int xrs_reclaim_partition(void *hdl, u32 start_col, u32 ncols, struct xrs_action_load *action)
+{
+	struct solver_state *xrs = hdl;
+	struct solver_rgroup *rgp = &xrs->rgp;
+	struct partition_node *pt_node;
+	struct solver_node *snode, *tmp;
+
+	/* Find the partition node */
+	list_for_each_entry(pt_node, &rgp->pt_node_list, list) {
+		if (pt_node->start_col == start_col && pt_node->ncols == ncols) {
+			/* Found it - force release ALL solver_nodes using this partition
+			 * This handles the CPU scheduling case where we preempt allocated
+			 * but idle partitions (nshared > 0 but FIFO empty).
+			 */
+			if (pt_node->nshared > 0) {
+				drm_info(xrs->cfg.ddev,
+					 "Force releasing %d solver_nodes for partition [%u, %u) reclaim\n",
+					 pt_node->nshared, start_col, start_col + ncols);
+
+				/* Remove all solver_nodes pointing to this partition */
+				list_for_each_entry_safe(snode, tmp, &rgp->node_list, list) {
+					if (snode->pt_node == pt_node) {
+						drm_dbg(xrs->cfg.ddev,
+							"Force releasing solver_node rid=0x%llx\n",
+							snode->rid);
+						list_del(&snode->list);
+						rgp->nnode--;
+						kfree(snode);
+						pt_node->nshared--;
+					}
+				}
+
+				/* Verify all are released */
+				if (pt_node->nshared != 0) {
+					drm_err(xrs->cfg.ddev,
+						"BUG: nshared=%d after force release!\n",
+						pt_node->nshared);
+					return -EINVAL;
+				}
+			}
+
+			/* Remove partition node from list and free */
+			list_del(&pt_node->list);
+			rgp->npartition_node--;
+			bitmap_clear(rgp->resbit, pt_node->start_col, pt_node->ncols);
+			kfree(pt_node);
+
+			/* Tell caller to destroy the AIE partition */
+			action->release_aie_part = true;
+			action->part.start_col = start_col;
+			action->part.ncols = ncols;
+
+			return 0;
+		}
+	}
+
+	drm_err(xrs->cfg.ddev, "Partition [%u, %u) not found for reclaim\n",
+		start_col, start_col + ncols);
+	return -ENOENT;
 }
 
 /*

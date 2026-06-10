@@ -135,6 +135,8 @@ struct solver_state {
 void *xrsm_init(struct init_config *cfg);
 int xrs_allocate_resource(void *hdl, struct alloc_requests *req, struct xrs_action_load *load_act);
 int xrs_release_resource(void *hdl, u64 rid, struct xrs_action_load *action);
+int xrs_get_partition_nshared(void *hdl, u32 start_col, u32 ncols);
+int xrs_reclaim_partition(void *hdl, u32 start_col, u32 ncols, struct xrs_action_load *action);
 
 struct solver_node *rg_search_node(struct solver_rgroup *rgp, u64 rid);
 

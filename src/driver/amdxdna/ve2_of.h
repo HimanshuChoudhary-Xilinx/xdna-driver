@@ -82,6 +82,13 @@ struct amdxdna_ctx_command_fifo {
 	struct list_head                list;
 };
 
+struct ve2_sched_entry {
+	struct list_head		list;
+	struct amdxdna_ctx		*hwctx;
+	bool				in_list;
+	u64				pending_cmd_index;
+};
+
 struct amdxdna_ctx_priv {
 	u64				id; /* Unique incrementing hwctx ID */
 	u32				start_col;
@@ -97,6 +104,10 @@ struct amdxdna_ctx_priv {
 	struct timer_list		event_timer;
 	bool			misc_intrpt_flag; /* Hardware sync required */
 	struct mutex			privctx_lock; /* protect private ctx */
+
+	/* Dynamic scheduling fields */
+	struct ve2_sched_entry		sched_entry; /* Entry for device-level scheduler */
+	struct amdxdna_mgmtctx		*mgmtctx; /* Currently assigned partition (NULL if not assigned) */
 };
 
 struct amdxdna_dev_priv {
@@ -149,6 +160,12 @@ struct amdxdna_dev_hdl {
 	struct ve2_mem_topology		mem_topology;
 	struct xarray			hwctx_ids; /* XArray for hwctx ID allocation */
 	u32				next_hwctx_id; /* Next ID hint for xa_alloc_cyclic */
+
+	/* Device-level dynamic scheduler */
+	struct list_head		pending_hwctx_list; /* List of hwctx waiting for scheduling */
+	struct mutex			pending_lock; /* Protects pending_hwctx_list */
+	struct workqueue_struct		*sched_wq; /* Workqueue for scheduler */
+	struct work_struct		sched_work; /* Work item for scheduler */
 };
 
 /* ve2_of.c */

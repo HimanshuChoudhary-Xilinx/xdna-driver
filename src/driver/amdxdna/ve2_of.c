@@ -11,6 +11,9 @@
 #include "ve2_of.h"
 #include "ve2_mgmt.h"
 
+/* Forward declarations */
+static void ve2_scheduler_work_handler(struct work_struct *work);
+
 static int ve2_load_fw(struct amdxdna_dev_hdl *xdna_hdl)
 {
 	struct amdxdna_dev *xdna = xdna_hdl->xdna;
@@ -333,6 +336,164 @@ void ve2_auto_select_mem_bitmap(struct amdxdna_dev *xdna, struct amdxdna_ctx *hw
 	priv->mem_bitmap = 0;
 }
 
+/*
+ * ve2_find_available_partition - Find an idle partition for scheduling
+ * @xdna: Device handle
+ * @hwctx: Hardware context to schedule
+ *
+ * Scans through all partitions to find one that is idle and matches
+ * the hwctx column requirements (both start_col and ncol).
+ * Returns pointer to the mgmtctx or NULL if none available.
+ */
+/* Unused - XRS handles partition reuse via allocate_partition_shared() */
+#if 0
+struct amdxdna_mgmtctx *ve2_find_available_partition(struct amdxdna_dev *xdna,
+						      struct amdxdna_ctx *hwctx)
+{
+	struct amdxdna_dev_hdl *xdna_hdl = xdna->dev_handle;
+	struct amdxdna_mgmtctx *mgmtctx;
+	u32 required_cols;
+	u32 required_start_col;
+	bool match_start_col = false;
+	u32 col;
+
+	/* Determine required number of columns */
+	if (partition_size < hwctx->num_tiles)
+		required_cols = hwctx->num_tiles;
+	else
+		required_cols = partition_size;
+
+	/* Check if user specified a start column */
+	if (hwctx->qos.user_start_col != USER_START_COL_NOT_REQUESTED) {
+		required_start_col = hwctx->qos.user_start_col;
+		match_start_col = true;
+	}
+
+	XDNA_DBG(xdna, "sched_find: hwctx=%p num_col=%u start_col=%s",
+		 hwctx, required_cols, match_start_col ? (char[]){required_start_col + '0', '\0'} : "any");
+
+	/* Scan all partitions to find an idle one with matching requirements */
+	for (col = 0; col < xdna_hdl->aie_dev_info.cols; col++) {
+		mgmtctx = &xdna_hdl->ve2_mgmtctx[col];
+
+		/* Skip if partition is not initialized */
+		if (!mgmtctx->mgmt_aiedev)
+			continue;
+
+		mutex_lock(&mgmtctx->ctx_lock);
+
+		/* Check if partition is idle AND matches requirements */
+		if (!mgmtctx->active_ctx && mgmtctx->is_partition_idle) {
+			/* Must match ncol */
+			if (mgmtctx->ncol != required_cols) {
+				mutex_unlock(&mgmtctx->ctx_lock);
+				continue;
+			}
+
+			/* If user specified start_col, must match that too */
+			if (match_start_col && mgmtctx->start_col != required_start_col) {
+				mutex_unlock(&mgmtctx->ctx_lock);
+				continue;
+			}
+
+			/* Found a matching partition! */
+			mutex_unlock(&mgmtctx->ctx_lock);
+			XDNA_DBG(xdna, "sched_find: found partition [%u,%u) for hwctx=%p",
+				 mgmtctx->start_col, mgmtctx->ncol, hwctx);
+			return mgmtctx;
+		}
+		mutex_unlock(&mgmtctx->ctx_lock);
+	}
+
+	XDNA_DBG(xdna, "sched_find: no matching partition for hwctx=%p", hwctx);
+	return NULL;
+}
+#endif
+
+/*
+ * ve2_scheduler_work_handler - Unified scheduler work handler
+ * @work: Work struct
+ *
+ * This is the SINGLE POINT OF ENTRY for ALL command scheduling.
+ * It handles BOTH partition allocation and command scheduling.
+ * ALL commands go through this device scheduler workqueue.
+ */
+static void ve2_scheduler_work_handler(struct work_struct *work)
+{
+	struct amdxdna_dev_hdl *xdna_hdl = container_of(work, struct amdxdna_dev_hdl, sched_work);
+	struct amdxdna_dev *xdna = xdna_hdl->xdna;
+	struct ve2_sched_entry *entry, *next;
+	struct amdxdna_ctx *hwctx;
+	struct amdxdna_mgmtctx *mgmtctx;
+	int ret;
+
+	XDNA_DBG(xdna, "sched_work: handler started");
+
+	mutex_lock(&xdna_hdl->pending_lock);
+
+	list_for_each_entry_safe(entry, next, &xdna_hdl->pending_hwctx_list, list) {
+		hwctx = entry->hwctx;
+		/* Check if hwctx already has a partition assigned */
+		if (!hwctx->priv->mgmtctx) {
+			/* No partition assigned yet - call ve2_xrs_request */
+			/* XRS will either share an existing partition (nshared++, create_aie_part=false) */
+			/* or create a new one (nshared=1, create_aie_part=true) */
+			mutex_unlock(&xdna_hdl->pending_lock);
+
+			XDNA_DBG(xdna, "sched_work: hwctx=%p requesting partition", hwctx);
+
+			ret = ve2_xrs_request(xdna, hwctx);
+			if (ret) {
+				/* XRS allocation failed, leave in pending list for retry */
+				XDNA_ERR(xdna,
+					 "sched_work: hwctx=%p partition request failed ret=%d",
+					 hwctx, ret);
+				mutex_lock(&xdna_hdl->pending_lock);
+				continue;
+			}
+
+			mgmtctx = hwctx->priv->mgmtctx;
+			XDNA_DBG(xdna, "sched_work: hwctx=%p got partition [%u,%u)",
+				 hwctx, hwctx->priv->start_col, hwctx->priv->num_col);
+
+			/* Auto-select memory bitmap based on start_col */
+			ve2_auto_select_mem_bitmap(xdna, hwctx);
+
+			mutex_lock(&xdna_hdl->pending_lock);
+		}
+
+		/* Now hwctx has a partition - schedule the command */
+		mgmtctx = hwctx->priv->mgmtctx;
+		if (!mgmtctx) {
+			XDNA_ERR(xdna, "sched_work: hwctx=%p NULL mgmtctx", hwctx);
+			continue;
+		}
+
+		XDNA_DBG(xdna, "sched_work: scheduling cmd_index=%llu hwctx=%p",
+			 entry->pending_cmd_index, hwctx);
+
+		mutex_unlock(&xdna_hdl->pending_lock);
+
+		/* Schedule the command to the partition FIFO */
+		ret = ve2_mgmt_schedule_cmd(xdna, hwctx, entry->pending_cmd_index);
+		if (ret) {
+			XDNA_ERR(xdna, "sched_work: schedule_cmd failed hwctx=%p ret=%d",
+				 hwctx, ret);
+			mutex_lock(&xdna_hdl->pending_lock);
+			continue;
+		}
+
+		/* Remove from pending list */
+		mutex_lock(&xdna_hdl->pending_lock);
+		list_del_init(&entry->list);
+		entry->in_list = false;
+	}
+
+	mutex_unlock(&xdna_hdl->pending_lock);
+
+	XDNA_DBG(xdna, "sched_work: handler completed");
+}
+
 static int ve2_init(struct amdxdna_dev *xdna)
 {
 	struct device *dev = xdna->ddev.dev;
@@ -354,6 +515,17 @@ static int ve2_init(struct amdxdna_dev *xdna)
 	/* Initialize XArray for hwctx ID allocation */
 	xa_init_flags(&xdna_hdl->hwctx_ids, XA_FLAGS_ALLOC);
 	xdna_hdl->next_hwctx_id = 1; /* Start IDs from 1 */
+
+	/* Initialize device-level dynamic scheduler */
+	INIT_LIST_HEAD(&xdna_hdl->pending_hwctx_list);
+	mutex_init(&xdna_hdl->pending_lock);
+	xdna_hdl->sched_wq = alloc_workqueue("ve2_sched_wq", WQ_UNBOUND | WQ_HIGHPRI, 1);
+	if (!xdna_hdl->sched_wq) {
+		XDNA_ERR(xdna, "Failed to create scheduler workqueue");
+		return -ENOMEM;
+	}
+	INIT_WORK(&xdna_hdl->sched_work, ve2_scheduler_work_handler);
+	XDNA_INFO(xdna, "Initialized unified device scheduler");
 
 	if (ve2_hwctx_limit)
 		xdna_hdl->hwctx_limit = ve2_hwctx_limit;
@@ -446,8 +618,25 @@ static int ve2_init(struct amdxdna_dev *xdna)
 static void ve2_fini(struct amdxdna_dev *xdna)
 {
 	struct amdxdna_dev_hdl *xdna_hdl = xdna->dev_handle;
+	u32 col;
+
 	/* All resources are managed by devm_/drmm_ */
 	XDNA_DBG(xdna, "VE2 device cleanup: releasing resources");
+
+	/* Cleanup scheduler workqueue */
+	if (xdna_hdl->sched_wq) {
+		cancel_work_sync(&xdna_hdl->sched_work);
+		destroy_workqueue(xdna_hdl->sched_wq);
+		xdna_hdl->sched_wq = NULL;
+	}
+
+	/* Destroy all active partitions before driver unload */
+	for (col = 0; col < xdna_hdl->aie_dev_info.cols; col++) {
+		struct amdxdna_mgmtctx *mgmtctx = &xdna_hdl->ve2_mgmtctx[col];
+
+		if (mgmtctx->mgmt_aiedev)
+			ve2_mgmt_destroy_partition(mgmtctx);
+	}
 
 	ve2_cma_mem_region_remove(xdna);
 

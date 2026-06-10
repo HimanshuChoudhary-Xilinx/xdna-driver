@@ -166,6 +166,162 @@ int ve2_xrs_col_list(struct amdxdna_dev *xdna, struct alloc_requests *xrs_req,
 	return 0;
 }
 
+/**
+ * ve2_detach_hwctx_from_partition - Detach hwctx from partition and re-enqueue
+ * @xdna: Device handle
+ * @mgmtctx: Partition to detach from
+ * @hwctx: Hardware context to detach
+ *
+ * Detaches hwctx from partition and puts it back in scheduler queue.
+ * This is used for partition preemption (context switching).
+ */
+static void ve2_detach_hwctx_from_partition(struct amdxdna_dev *xdna,
+					     struct amdxdna_mgmtctx *mgmtctx,
+					     struct amdxdna_ctx *hwctx)
+{
+	struct amdxdna_dev_hdl *xdna_hdl = xdna->dev_handle;
+	struct amdxdna_ctx_priv *nhwctx = hwctx->priv;
+
+	XDNA_DBG(xdna, "detach: hwctx=%p from partition [%u,%u)",
+		 hwctx, mgmtctx->start_col, mgmtctx->start_col + mgmtctx->ncol);
+
+	/* Remove from partition's FIFO */
+	ve2_fifo_remove_ctx(mgmtctx, hwctx);
+
+	/* Clear active context if this is it */
+	if (mgmtctx->active_ctx == hwctx) {
+		mgmtctx->active_ctx = NULL;
+		mgmtctx->is_partition_idle = 1;
+	}
+
+	/* Clear hwctx's partition assignment */
+	nhwctx->mgmtctx = NULL;
+	/* Note: Keep start_col/num_col so ve2_xrs_release can work */
+
+	/* Re-enqueue to scheduler pending list for rescheduling */
+	mutex_lock(&xdna_hdl->pending_lock);
+	if (!nhwctx->sched_entry.in_list) {
+		list_add_tail(&nhwctx->sched_entry.list, &xdna_hdl->pending_hwctx_list);
+		nhwctx->sched_entry.in_list = true;
+	}
+	mutex_unlock(&xdna_hdl->pending_lock);
+}
+
+/**
+ * ve2_try_reclaim_for_allocation - Try to free space for a new partition allocation
+ * @xdna: Device handle
+ * @start_col: Start column of requested range
+ * @ncols: Number of columns in requested range
+ * @allow_preemption: If true, allows preempting active partitions
+ *
+ * Returns: 1 if space was freed, 0 if nothing could be reclaimed
+ *
+ * Strategy:
+ * 1. Find all partitions overlapping [start_col, start_col+ncols)
+ * 2. If any idle → reclaim all idle overlapping partitions
+ * 3. If all busy and allow_preemption → pick best victim and preempt
+ *
+ * Best victim selection:
+ * - Prefer exact size match (can reuse partition after preemption)
+ * - Otherwise pick smallest overlapping (minimize wasted columns)
+ */
+static int ve2_try_reclaim_for_allocation(struct amdxdna_dev *xdna, u32 start_col, u32 ncols,
+					   bool allow_preemption)
+{
+	struct amdxdna_dev_hdl *xdna_hdl = xdna->dev_handle;
+	u32 end_col = start_col + ncols;
+	u32 reclaimed = 0;
+	u32 col;
+
+	struct amdxdna_mgmtctx *smallest_victim = NULL;
+	u32 smallest_size = U32_MAX;
+
+	XDNA_DBG(xdna, "reclaim: searching [%u,%u) preempt=%d", start_col, end_col, allow_preemption);
+
+	/* PASS 1: Try to reclaim idle partitions first */
+	for (col = 0; col < xdna_hdl->aie_dev_info.cols; col++) {
+		struct amdxdna_mgmtctx *mgmtctx = &xdna_hdl->ve2_mgmtctx[col];
+		u32 part_end;
+		bool is_idle;
+
+		/* Skip if no partition at this slot */
+		if (!mgmtctx->mgmt_aiedev)
+			continue;
+
+		part_end = mgmtctx->start_col + mgmtctx->ncol;
+
+		/* Check if partition overlaps with requested range */
+		if (mgmtctx->start_col >= end_col || part_end <= start_col)
+			continue; /* No overlap */
+
+		/* Check if partition is idle (FIFO empty) */
+		mutex_lock(&mgmtctx->ctx_lock);
+		is_idle = list_empty(&mgmtctx->ctx_command_fifo_head);
+		mutex_unlock(&mgmtctx->ctx_lock);
+
+		if (is_idle) {
+			/* Idle partition - reclaim it */
+			XDNA_DBG(xdna, "reclaim: idle partition [%u,%u)", mgmtctx->start_col, part_end);
+
+			if (ve2_xrs_reclaim_partition(xdna, mgmtctx->start_col, mgmtctx->ncol) == 0)
+				reclaimed++;
+		} else if (allow_preemption) {
+			/* Active partition - track as potential victim (pick smallest) */
+			if (mgmtctx->ncol < smallest_size) {
+				smallest_size = mgmtctx->ncol;
+				smallest_victim = mgmtctx;
+			}
+		}
+	}
+
+	/* If we reclaimed any idle partitions, we're done */
+	if (reclaimed > 0) {
+		XDNA_DBG(xdna, "reclaim: freed %u idle partitions", reclaimed);
+		return reclaimed;
+	}
+
+	/* PASS 2: No idle partitions - preempt if allowed */
+	if (allow_preemption && smallest_victim) {
+		struct amdxdna_mgmtctx *mgmtctx = smallest_victim;
+		u32 part_end = mgmtctx->start_col + mgmtctx->ncol;
+		struct amdxdna_ctx_command_fifo *c_ctx, *t_ctx;
+		int detached = 0;
+
+		XDNA_INFO(xdna, "reclaim: preempting partition [%u,%u) size=%u",
+			  mgmtctx->start_col, part_end, mgmtctx->ncol);
+
+		/* Detach all hwctx from this partition and re-enqueue them */
+		mutex_lock(&mgmtctx->ctx_lock);
+
+		/* Detach active_ctx if present */
+		if (mgmtctx->active_ctx) {
+			ve2_detach_hwctx_from_partition(xdna, mgmtctx, mgmtctx->active_ctx);
+			detached++;
+		}
+
+		/* Detach all contexts in FIFO */
+		list_for_each_entry_safe(c_ctx, t_ctx, &mgmtctx->ctx_command_fifo_head, list) {
+			list_del(&c_ctx->list);
+			ve2_detach_hwctx_from_partition(xdna, mgmtctx, c_ctx->ctx);
+			kfree(c_ctx);
+			detached++;
+		}
+
+		mutex_unlock(&mgmtctx->ctx_lock);
+
+		XDNA_DBG(xdna, "reclaim: detached %d hwctx, reclaiming partition", detached);
+
+		/* Now reclaim the partition */
+		if (ve2_xrs_reclaim_partition(xdna, mgmtctx->start_col, mgmtctx->ncol) == 0)
+			reclaimed = 1;
+		else
+			XDNA_ERR(xdna, "reclaim: failed to reclaim partition after preemption");
+	}
+
+	XDNA_DBG(xdna, "reclaim: total %u partitions (preempt=%d)", reclaimed, allow_preemption);
+	return reclaimed;
+}
+
 int ve2_xrs_request(struct amdxdna_dev *xdna, struct amdxdna_ctx *hwctx)
 {
 	struct solver_state *xrs = xdna->dev_handle->xrs_hdl;
@@ -173,6 +329,8 @@ int ve2_xrs_request(struct amdxdna_dev *xdna, struct amdxdna_ctx *hwctx)
 	struct xrs_action_load load_act = {0};
 	struct amdxdna_ctx_priv *nhwctx = NULL;
 	struct alloc_requests *xrs_req;
+	int reclaim_attempts = 0;
+	const int MAX_RECLAIM_ATTEMPTS = 2;
 	int ret;
 
 	if (!xrs)
@@ -226,9 +384,47 @@ int ve2_xrs_request(struct amdxdna_dev *xdna, struct amdxdna_ctx *hwctx)
 	}
 	xrs_req->rqos.user_start_col = hwctx->qos.user_start_col;
 	xrs_req->rid = (uintptr_t)hwctx;
+
+retry_allocation:
 	ret = xrs_allocate_resource(xrs, xrs_req, &load_act);
+	if (ret && reclaim_attempts < MAX_RECLAIM_ATTEMPTS) {
+		/* XRS allocation failed - try reclaiming overlapping idle partitions */
+		XDNA_INFO(xdna, "[XRS-REQUEST] Allocation failed ret=%d, attempting reclamation (attempt %d/%d)",
+			  ret, reclaim_attempts + 1, MAX_RECLAIM_ATTEMPTS);
+
+		/* Unlock XRS while reclaiming to avoid deadlock */
+		mutex_unlock(&xrs->xrs_lock);
+
+		/* Reclaim overlapping partitions for all candidate start columns
+		 * First attempt: only idle partitions (allow_preemption=false)
+		 * Second attempt: allow preemption of active partitions (allow_preemption=true)
+		 */
+		bool allow_preemption = (reclaim_attempts > 0);
+		int total_reclaimed = 0;
+
+		for (int i = 0; i < xrs_req->cdo.cols_len; i++) {
+			u32 candidate_col = xrs_req->cdo.start_cols[i];
+			int reclaimed = ve2_try_reclaim_for_allocation(xdna, candidate_col,
+									xrs_req->cdo.ncols,
+									allow_preemption);
+			total_reclaimed += reclaimed;
+		}
+
+		/* Re-lock XRS before retrying allocation */
+		mutex_lock(&xrs->xrs_lock);
+
+		if (total_reclaimed > 0) {
+			reclaim_attempts++;
+			XDNA_INFO(xdna, "[XRS-REQUEST] Reclaimed %d partitions, retrying allocation", total_reclaimed);
+			goto retry_allocation;
+		}
+
+		XDNA_ERR(xdna, "[XRS-REQUEST] No reclaimable partitions found");
+	}
+
 	if (ret) {
-		XDNA_ERR(xdna, "Allocate XRS resource failed, ret %d", ret);
+		XDNA_ERR(xdna, "Allocate XRS resource failed after %d reclaim attempts, ret %d",
+			 reclaim_attempts, ret);
 		mutex_unlock(&xrs->xrs_lock);
 		goto free_start_cols;
 	}
@@ -241,6 +437,7 @@ int ve2_xrs_request(struct amdxdna_dev *xdna, struct amdxdna_ctx *hwctx)
 	}
 
 	nhwctx = hwctx->priv;
+	nhwctx->mgmtctx = mgmtctx;  /* Assign partition to hwctx */
         nhwctx->start_col = mgmtctx->start_col;
         nhwctx->num_col = mgmtctx->ncol;
 	nhwctx->aie_dev = mgmtctx->mgmt_aiedev;
@@ -254,7 +451,7 @@ int ve2_xrs_request(struct amdxdna_dev *xdna, struct amdxdna_ctx *hwctx)
 		ret = -ENOMEM;
 		goto destroy_partition;
 	}
-	
+
         hwctx->start_col = nhwctx->start_col;
 	hwctx->num_col = nhwctx->num_col;
 	mutex_unlock(&xrs->xrs_lock);
@@ -362,33 +559,22 @@ void ve2_mgmt_handshake_init(struct amdxdna_dev *xdna,
 	nhwctx->args->handshake = (struct aie_op_handshake_data *)hs_data;
 	nhwctx->args->init_opts = (AIE_PART_INIT_OPT_DEFAULT | AIE_PART_INIT_OPT_HANDSHAKE |
 		AIE_PART_INIT_OPT_DIS_TLAST_ERROR) & ~AIE_PART_INIT_OPT_UC_ENB_MEM_PRIV;
-	XDNA_DBG(xdna, "Handshake init hwctx : %p\n", hwctx);
-	XDNA_DBG(xdna,
-		 "partition init: start_col=%u num_col=%u hwctx=%p pid=%d",
+
+	XDNA_DBG(xdna, "partition_init: start_col=%u num_col=%u hwctx=%p pid=%d",
 		 start_col, num_col, hwctx, hwctx->client->pid);
-	XDNA_DBG(xdna,
-		 "handshake: ve2_partition_initialize enter start_col=%u num_col=%u hwctx=%p",
-		 start_col, num_col, hwctx);
+
 	trace_amdxdna_trace_point("XRT_PROFILING_TRACE_PARTITION_INIT",
 				  hwctx->client->pid, start_col, hwctx->priv->id, num_col);
 	ret = ve2_partition_initialize(nhwctx->aie_dev, nhwctx->args);
-	XDNA_DBG(xdna,
-		 "partition init: aie_partition_initialize returned %d (start_col=%u num_col=%u hwctx=%p)",
-		 ret, start_col, num_col, hwctx);
 	if (ret < 0) {
-		XDNA_DBG(xdna, "handshake: ve2_partition_initialize failed ret=%d", ret);
 		XDNA_ERR(xdna, "aie partition init failed: %d", ret);
 		goto release_hs_data;
 	}
 	trace_amdxdna_trace_point("XRT_PROFILING_TRACE_PARTITION_DONE",
 				  hwctx->client->pid, start_col, hwctx->priv->id, num_col);
 
-	XDNA_DBG(xdna, "handshake: ve2_partition_initialize ok hwctx=%p", hwctx);
-
 	for (int col = num_col - 1; col >= 0; col--)
 		ve2_partition_uc_wakeup(nhwctx->aie_dev, col);
-
-	XDNA_DBG(xdna, "partition uc_wakeup done cols=%u hwctx=%p", num_col, hwctx);
 
 release_hs_data:
 	ve2_free_hs_data(hs_data, num_col);
@@ -455,9 +641,13 @@ ve2_response_ctx_switch_req(struct amdxdna_mgmtctx *mgmtctx)
 int ve2_mgmt_schedule_cmd(struct amdxdna_dev *xdna, struct amdxdna_ctx *hwctx,
 			  u64 command_index)
 {
-	struct amdxdna_mgmtctx  *mgmtctx =
-		&xdna->dev_handle->ve2_mgmtctx[hwctx->start_col];
+	struct amdxdna_mgmtctx  *mgmtctx = hwctx->priv->mgmtctx;
 	int ret;
+
+	if (!mgmtctx) {
+		XDNA_ERR(xdna, "hwctx %p is not assigned to any partition", hwctx);
+		return -EINVAL;
+	}
 
 	XDNA_DBG(xdna,
 		 "schedule_cmd: enter command_index=%llu start_col=%u hwctx=%p pid=%d",
@@ -1208,7 +1398,29 @@ ve2_create_mgmt_partition(struct amdxdna_dev *xdna,
 		&xdna->dev_handle->ve2_mgmtctx[start_col];
 	int ret = 0;
 
+	/* Check if partition ALREADY exists (lazy reclamation case: nshared went 0→1) */
+	/* Must match BOTH start_col AND ncols */
+	if (mgmtctx->mgmt_aiedev && mgmtctx->ncol == load_act->part.ncols) {
+		/* Sequential reuse: partition exists from previous hwctx that finished */
+		XDNA_DBG(xdna, "partition_reuse: [%u,%u) already exists",
+			 load_act->part.start_col, load_act->part.ncols);
+		return mgmtctx;
+	}
+
+	/* If mgmt_aiedev exists but ncols doesn't match, this is a different partition size */
+	/* The old partition must be destroyed before creating new one at same start_col */
+	if (mgmtctx->mgmt_aiedev) {
+		XDNA_ERR(xdna, "partition_create: size mismatch [%u,%u) vs [%u,%u)",
+			 load_act->part.start_col, mgmtctx->ncol,
+			 load_act->part.start_col, load_act->part.ncols);
+		return NULL;
+	}
+
 	if (load_act->create_aie_part) {
+		/* XRS says: Create NEW partition (brand new, not lazy reclaim reuse) */
+		XDNA_DBG(xdna, "partition_create: creating [%u,%u)",
+			 load_act->part.start_col, load_act->part.ncols);
+
 		request.user_event1_complete = ve2_irq_handler;
 		request.user_event1_priv = mgmtctx;
 		request.partition_id = aie_calc_part_id(load_act->part.start_col,
@@ -1244,7 +1456,7 @@ ve2_create_mgmt_partition(struct amdxdna_dev *xdna,
 		INIT_WORK(&mgmtctx->sched_work, ve2_scheduler_work);
 		/* Register AIE error call back function. */
 		ret = aie_register_error_notification(mgmtctx->mgmt_aiedev, ve2_aie_error_cb, mgmtctx);
-		XDNA_DBG(xdna, "Registered AIE error call back function, ret : %d\n", ret);
+		XDNA_DBG(xdna, "Registered AIE error callback, ret=%d", ret);
 	}
 
 	return mgmtctx;
@@ -1287,6 +1499,8 @@ int ve2_create_coredump(struct amdxdna_dev *xdna,
 	return rel_size;
 }
 
+/* Unused for lazy reclamation - partitions cleared on destroy */
+#if 0
 static void cert_clear_partition(struct amdxdna_dev *xdna, struct amdxdna_ctx_priv *nhwctx)
 {
 	struct device *aie_dev = nhwctx->aie_dev;
@@ -1305,6 +1519,7 @@ static void cert_clear_partition(struct amdxdna_dev *xdna, struct amdxdna_ctx_pr
 		XDNA_ERR(xdna, "aie partition handshake update failed, ret: %d\n", ret);
 	ve2_free_hs_data(hs_data, num_col);
 }
+#endif
 
 int ve2_xrs_release(struct amdxdna_dev *xdna, struct amdxdna_ctx *hwctx)
 {
@@ -1315,22 +1530,85 @@ int ve2_xrs_release(struct amdxdna_dev *xdna, struct amdxdna_ctx *hwctx)
         struct xrs_action_load load_act;
         int ret;
 
-        mutex_lock(&xrs->xrs_lock);
-	ret = xrs_release_resource(xdna->dev_handle->xrs_hdl, (uintptr_t)hwctx, &load_act);
-        mutex_unlock(&xrs->xrs_lock);
-        if (ret)
-                return ret;
-
         mgmtctx = &xdna->dev_handle->ve2_mgmtctx[start_col];
-        if (load_act.release_aie_part) {
-                cert_clear_partition(xdna, nhwctx);
-                ve2_mgmt_destroy_partition(mgmtctx);
-        } else {
-                mutex_lock(&mgmtctx->ctx_lock);
-                if (mgmtctx->active_ctx == hwctx)
-                        mgmtctx->active_ctx = NULL;
-                mutex_unlock(&mgmtctx->ctx_lock);
+
+        mutex_lock(&xrs->xrs_lock);
+	/* Release resource tracking - for lazy reclamation this doesn't destroy partition */
+	ret = xrs_release_resource(xdna->dev_handle->xrs_hdl, (uintptr_t)hwctx, &load_act);
+        if (ret) {
+                mutex_unlock(&xrs->xrs_lock);
+                XDNA_ERR(xdna, "xrs_release failed ret=%d", ret);
+                return ret;
         }
+
+        /* For lazy reclamation: partition stays alive, just clear active_ctx */
+        mutex_lock(&mgmtctx->ctx_lock);
+        if (mgmtctx->active_ctx == hwctx) {
+                mgmtctx->active_ctx = NULL;
+                mgmtctx->is_partition_idle = 1;
+        }
+        mutex_unlock(&mgmtctx->ctx_lock);
+        mutex_unlock(&xrs->xrs_lock);
+
+        return 0;
+}
+
+/*
+ * ve2_xrs_reclaim_partition - Explicitly reclaim/destroy a partition
+ *
+ * This is called when we need to free up space for new allocations.
+ * Unlike ve2_xrs_release which keeps partitions alive, this actually destroys them.
+ *
+ * IMPORTANT: After forcefully reclaiming, all affected hwctx will have their XRS
+ * tracking (solver_nodes) deleted. We must clear their start_col/num_col fields
+ * so ve2_hwctx_fini doesn't try to call ve2_xrs_release (which would fail with
+ * "node not exist" error).
+ */
+int ve2_xrs_reclaim_partition(struct amdxdna_dev *xdna, u32 start_col, u32 ncols)
+{
+        struct solver_state *xrs = xdna->dev_handle->xrs_hdl;
+        struct amdxdna_mgmtctx *mgmtctx = &xdna->dev_handle->ve2_mgmtctx[start_col];
+        struct xrs_action_load load_act = {0};
+        struct amdxdna_ctx_command_fifo *c_ctx;
+        struct amdxdna_ctx_priv *nhwctx;
+        int ret;
+
+        /*
+         * Before forcefully reclaiming XRS tracking, clear start_col/num_col
+         * for all hwctx that were using this partition. This prevents
+         * ve2_hwctx_fini from trying to call ve2_xrs_release on a
+         * solver_node that no longer exists.
+         */
+        mutex_lock(&mgmtctx->ctx_lock);
+
+        /* Clear active_ctx's XRS fields if present */
+        if (mgmtctx->active_ctx) {
+                nhwctx = mgmtctx->active_ctx->priv;
+                nhwctx->start_col = 0;
+                nhwctx->num_col = 0;
+        }
+
+        /* Clear XRS fields for all hwctx in FIFO */
+        list_for_each_entry(c_ctx, &mgmtctx->ctx_command_fifo_head, list) {
+                nhwctx = c_ctx->ctx->priv;
+                nhwctx->start_col = 0;
+                nhwctx->num_col = 0;
+        }
+
+        mutex_unlock(&mgmtctx->ctx_lock);
+
+        /* Now forcefully reclaim XRS tracking (this deletes solver_nodes) */
+        mutex_lock(&xrs->xrs_lock);
+        ret = xrs_reclaim_partition(xrs, start_col, ncols, &load_act);
+        mutex_unlock(&xrs->xrs_lock);
+
+        if (ret) {
+                XDNA_ERR(xdna, "xrs_reclaim failed ret=%d", ret);
+                return ret;
+        }
+
+        /* Actually destroy the AIE partition */
+        ve2_mgmt_destroy_partition(mgmtctx);
 
         return 0;
 }
@@ -1348,6 +1626,8 @@ void ve2_mgmt_destroy_partition(struct amdxdna_mgmtctx  *mgmtctx)
         struct amdxdna_dev *xdna = mgmtctx->xdna;
         struct workqueue_struct *wq = NULL;
 
+        XDNA_DBG(xdna, "partition_destroy: [%u,%u)", mgmtctx->start_col, mgmtctx->ncol);
+
         mutex_lock(&mgmtctx->ctx_lock);
         /* Update the active context as partition doesn't exists any more */
         mgmtctx->mgmtctx_workq = NULL;
@@ -1355,14 +1635,18 @@ void ve2_mgmt_destroy_partition(struct amdxdna_mgmtctx  *mgmtctx)
         wq = mgmtctx->mgmtctx_workq;
         mutex_unlock(&mgmtctx->ctx_lock);
 
-        if (wq)
+        /* Cancel any pending partition work before destroying it */
+        if (wq) {
+                cancel_work_sync(&mgmtctx->sched_work);
                 destroy_workqueue(wq);
+        }
 
         aie_unregister_error_notification(mgmtctx->mgmt_aiedev);
-
-        XDNA_DBG(xdna, "%s: Un-registered ve2_aie_error_cb() callback\n", __func__);
         aie_partition_teardown(mgmtctx->mgmt_aiedev);
         aie_partition_release(mgmtctx->mgmt_aiedev);
+
+        /* Clear mgmt_aiedev so ve2_create_mgmt_partition() knows partition is gone */
+        mgmtctx->mgmt_aiedev = NULL;
 }
 
 struct amdxdna_ctx *ve2_get_hwctx(struct amdxdna_dev *xdna, u32 col)

@@ -229,6 +229,17 @@ int ve2_xrs_request(struct amdxdna_dev *xdna, struct amdxdna_ctx *hwctx);
 int ve2_xrs_release(struct amdxdna_dev *xdna, struct amdxdna_ctx *hwctx);
 
 /**
+ * ve2_xrs_reclaim_partition - Explicitly reclaim/destroy an idle partition.
+ * @xdna: Pointer to the device structure.
+ * @start_col: Starting column of partition to reclaim.
+ * @ncols: Number of columns in the partition.
+ *
+ * Returns 0 on success or a negative error code.
+ * This is used for lazy reclamation when we need to free space for new allocations.
+ */
+int ve2_xrs_reclaim_partition(struct amdxdna_dev *xdna, u32 start_col, u32 ncols);
+
+/**
  * ve2_mgmt_schedule_cmd - Schedule a command for execution.
  * @xdna: Pointer to the device structure.
  * @hwctx: Pointer to the hardware context.

@@ -942,6 +942,7 @@ int ve2_cmd_submit(struct amdxdna_sched_job *job, u32 *syncobj_hdls,
 {
 	struct amdxdna_ctx *hwctx = job->ctx;
 	struct amdxdna_dev *xdna = hwctx->client->xdna;
+	struct amdxdna_dev_hdl *xdna_hdl = xdna->dev_handle;
 	struct amdxdna_gem_obj *cmd_bo = job->cmd_bo;
 	int ret;
 	u32 op;
@@ -986,8 +987,37 @@ int ve2_cmd_submit(struct amdxdna_sched_job *job, u32 *syncobj_hdls,
 
 	XDNA_DBG(xdna, "hwctx %p cmd submitted: seq=%llu, total_submitted=%llu",
 		 hwctx, *seq, hwctx->submitted);
-	/* command_index = read_index when this job completes (last_slot + 1) */
-	ve2_mgmt_schedule_cmd(xdna, hwctx, *seq + 1);
+
+	/* ===================================================================
+	 * UNIFIED SCHEDULER: Single point of entry for ALL command submissions
+	 * ===================================================================
+	 * This is the single point of scheduling for both partition allocation
+	 * and command scheduling. ALL commands go through device scheduler workqueue.
+	 */
+	XDNA_DBG(xdna, "sched_submit: hwctx=%p seq=%llu pid=%d num_col=%u has_partition=%d",
+		 hwctx, *seq, hwctx->client->pid, hwctx->priv->num_col,
+		 !!hwctx->priv->mgmtctx);
+
+	mutex_lock(&xdna_hdl->pending_lock);
+
+	if (!hwctx->priv->sched_entry.in_list) {
+		hwctx->priv->sched_entry.hwctx = hwctx;
+		list_add_tail(&hwctx->priv->sched_entry.list,
+			      &xdna_hdl->pending_hwctx_list);
+		hwctx->priv->sched_entry.in_list = true;
+	}
+
+	/* Store command_index for this submission in hwctx private data.
+	 * The scheduler will use this when calling ve2_mgmt_schedule_cmd.
+	 */
+	hwctx->priv->sched_entry.pending_cmd_index = *seq + 1;
+
+	mutex_unlock(&xdna_hdl->pending_lock);
+
+	/* Trigger unified scheduler - it handles BOTH partition allocation
+	 * and command scheduling.
+	 */
+	queue_work(xdna_hdl->sched_wq, &xdna_hdl->sched_work);
 
 	trace_amdxdna_trace_point("XRT_PROFILING_TRACE_EXIT",
 				  hwctx->client->pid, hwctx->priv->start_col,
@@ -1436,9 +1466,18 @@ int ve2_hwctx_init(struct amdxdna_ctx *hwctx)
 
 	trace_amdxdna_trace_point("XRT_PROFILING_TRACE_ENTER",
 				  client->pid, 0, priv->id, 0);
-	XDNA_DBG(xdna, "hwctx init: enter hwctx=%p pid=%d", hwctx, client->pid);
+	XDNA_DBG(xdna, "hwctx_init: hwctx=%p id=%llu pid=%d num_tiles=%u",
+		 hwctx, priv->id, client->pid, hwctx->num_tiles);
 	init_waitqueue_head(&priv->waitq);
 
+	/* Initialize dynamic scheduling fields */
+	INIT_LIST_HEAD(&priv->sched_entry.list);
+	priv->sched_entry.hwctx = hwctx;
+	priv->sched_entry.in_list = false;
+	priv->sched_entry.pending_cmd_index = 0;
+	priv->mgmtctx = NULL;
+
+#if 0
 	ret = ve2_xrs_request(xdna, hwctx);
 	if (ret) {
 		XDNA_ERR(xdna, "XRS resource request failed, ret=%d", ret);
@@ -1447,6 +1486,7 @@ int ve2_hwctx_init(struct amdxdna_ctx *hwctx)
 
 	/* Auto-select memory bitmap based on start_col */
 	ve2_auto_select_mem_bitmap(xdna, hwctx);
+#endif
 
 	/* One host_queue entry per hwctx */
 	ret = ve2_create_host_queue(xdna, hwctx, &priv->hwctx_hsa_queue);
@@ -1469,8 +1509,8 @@ int ve2_hwctx_init(struct amdxdna_ctx *hwctx)
 	mutex_init(&priv->privctx_lock);
 	priv->state = AMDXDNA_HWCTX_STATE_IDLE;
 
-	XDNA_DBG(xdna, "hwctx init: ready hwctx=%p start_col=%u pid=%d",
-		 hwctx, priv->start_col, hwctx->client->pid);
+	XDNA_DBG(xdna, "hwctx_init: ready hwctx=%p id=%llu pid=%d",
+		 hwctx, priv->id, hwctx->client->pid);
 
 	trace_amdxdna_trace_point("XRT_PROFILING_TRACE_EXIT",
 				  hwctx->client->pid, priv->start_col, priv->id, 0);
@@ -1497,8 +1537,18 @@ void ve2_hwctx_fini(struct amdxdna_ctx *hwctx)
 
 	trace_amdxdna_trace_point("XRT_PROFILING_TRACE_ENTER",
 				  hwctx->client->pid, nhwctx->start_col, nhwctx->id, 0);
-	XDNA_DBG(xdna, "hwctx fini: enter hwctx=%p start_col=%u pid=%d",
-		 hwctx, nhwctx->start_col, hwctx->client->pid);
+	XDNA_DBG(xdna, "hwctx_fini: hwctx=%p id=%llu start_col=%u num_col=%u pid=%d",
+		 hwctx, nhwctx->id, nhwctx->start_col, nhwctx->num_col, hwctx->client->pid);
+
+	/* Remove from pending list if present */
+	if (nhwctx->sched_entry.in_list) {
+		struct amdxdna_dev_hdl *xdna_hdl = xdna->dev_handle;
+
+		mutex_lock(&xdna_hdl->pending_lock);
+		list_del_init(&nhwctx->sched_entry.list);
+		nhwctx->sched_entry.in_list = false;
+		mutex_unlock(&xdna_hdl->pending_lock);
+	}
 
 	if (enable_polling) {
 #if KERNEL_VERSION(6, 15, 0) <= LINUX_VERSION_CODE
@@ -1509,21 +1559,26 @@ void ve2_hwctx_fini(struct amdxdna_ctx *hwctx)
 	}
 
 	/*
-	 * Clear active_ctx FIRST to prevent IRQ handler from queueing new work,
-	 * remove all FIFO entries for this context to prevent use-after-free,
-	 * then cancel any pending work to ensure no work is accessing this context
+	 * Clear active_ctx and remove FIFO entries.
+	 * For lazy reclamation, partition stays alive for next hwctx to reuse.
 	 */
-	mgmtctx = &xdna->dev_handle->ve2_mgmtctx[nhwctx->start_col];
-	mutex_lock(&mgmtctx->ctx_lock);
-	if (mgmtctx->active_ctx == hwctx)
-		mgmtctx->active_ctx = NULL;
-	/* Remove all FIFO entries for this context before freeing it */
-	ve2_fifo_remove_ctx(mgmtctx, hwctx);
-	mutex_unlock(&mgmtctx->ctx_lock);
+	mgmtctx = nhwctx->mgmtctx;
+	if (mgmtctx) {
+		XDNA_DBG(xdna, "hwctx_fini: detaching hwctx=%p from partition [%u,%u)",
+			 hwctx, mgmtctx->start_col, mgmtctx->ncol);
 
-	/* Now cancel any pending work - it will see active_ctx as NULL and bail out */
-	if (mgmtctx->mgmtctx_workq)
-		cancel_work_sync(&mgmtctx->sched_work);
+		mutex_lock(&mgmtctx->ctx_lock);
+		if (mgmtctx->active_ctx == hwctx) {
+			mgmtctx->active_ctx = NULL;
+			mgmtctx->is_partition_idle = 1;
+		}
+		/* Remove all FIFO entries for this context before freeing it */
+		ve2_fifo_remove_ctx(mgmtctx, hwctx);
+		mutex_unlock(&mgmtctx->ctx_lock);
+
+		/* Clear the assignment - partition stays alive for reuse */
+		nhwctx->mgmtctx = NULL;
+	}
 
 	/*
 	 * Release jobs first to decrement BO refcounts, but they may not
@@ -1551,14 +1606,19 @@ void ve2_hwctx_fini(struct amdxdna_ctx *hwctx)
 	if (verbosity >= VERBOSITY_LEVEL_DBG)
 		ve2_get_firmware_status(hwctx);
 
-	ve2_xrs_release(xdna, hwctx);
+	/* Release XRS resource tracking only if partition was successfully allocated
+	 * Check if mgmtctx was ever assigned OR if start_col/num_col were set
+	 * (handles case where allocation partially succeeded)
+	 */
+	if (nhwctx->start_col != 0 || nhwctx->num_col != 0)
+		ve2_xrs_release(xdna, hwctx);
+
 	ve2_free_hsa_queue(xdna, &hwctx->priv->hwctx_hsa_queue);
 	kfree(hwctx->priv->hwctx_config);
 	mutex_destroy(&hwctx->priv->privctx_lock);
 
-	XDNA_DBG(xdna,
-		 "hwctx fini: hwctx=%p submitted=%llu completed=%llu pid=%d",
-		 hwctx, hwctx->submitted, hwctx->completed, hwctx->client->pid);
+	XDNA_DBG(xdna, "hwctx_fini: hwctx=%p id=%llu submitted=%llu completed=%llu pid=%d",
+		 hwctx, nhwctx->id, hwctx->submitted, hwctx->completed, hwctx->client->pid);
 
 	trace_amdxdna_trace_point("XRT_PROFILING_TRACE_EXIT",
 				  hwctx->client->pid, nhwctx->id, hwctx->submitted,
