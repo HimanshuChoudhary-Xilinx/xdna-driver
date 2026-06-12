@@ -6,6 +6,7 @@
 #include <boost/optional.hpp>
 #include <sys/ioctl.h>
 #include <sys/mman.h>
+#include <iostream>
 
 #include "core/edge/common/aie_parser.h"
 #include "core/edge/user/hwctx_object.h"
@@ -126,6 +127,28 @@ xdna_aie_array(const xrt_core::device* device, const xdna_hwctx* hwctx_obj)
   dev_inst = nullptr;
   adf::driver_config driver_config = get_driver_config_hwctx(device, hwctx_obj);
 
+  shim_debug("xdna_aie_array: driver_config: hw_gen=%u base_addr=0x%lx col_shift=%u row_shift=%u"
+             " num_columns=%u num_rows=%u shim_row=%u mem_row_start=%u mem_num_rows=%u"
+             " aie_tile_row_start=%u aie_tile_num_rows=%u",
+             (unsigned)driver_config.hw_gen,
+             (unsigned long)driver_config.base_address,
+             (unsigned)driver_config.column_shift,
+             (unsigned)driver_config.row_shift,
+             (unsigned)driver_config.num_columns,
+             (unsigned)driver_config.num_rows,
+             (unsigned)driver_config.shim_row,
+             (unsigned)driver_config.mem_row_start,
+             (unsigned)driver_config.mem_num_rows,
+             (unsigned)driver_config.aie_tile_row_start,
+             (unsigned)driver_config.aie_tile_num_rows);
+  std::cout << "[xdna_aie_array] driver_config:"
+            << " hw_gen=" << (unsigned)driver_config.hw_gen
+            << " base_addr=0x" << std::hex << driver_config.base_address << std::dec
+            << " col_shift=" << (unsigned)driver_config.column_shift
+            << " num_columns=" << (unsigned)driver_config.num_columns
+            << " num_rows=" << (unsigned)driver_config.num_rows
+            << std::endl;
+
   XAie_SetupConfig(ConfigPtr,
       driver_config.hw_gen,
       driver_config.base_address,
@@ -140,29 +163,57 @@ xdna_aie_array(const xrt_core::device* device, const xdna_hwctx* hwctx_obj)
       driver_config.aie_tile_num_rows);
 
   auto part_info = hwctx_obj->get_partition_info();
+  shim_debug("xdna_aie_array: part_info: partition_id=0x%x start_col=%u num_cols=%u base_addr=0x%lx"
+             " (full_array_id=0x%x)",
+             part_info.partition_id,
+             part_info.start_column,
+             part_info.num_columns,
+             (unsigned long)part_info.base_address,
+             xrt_core::edge::aie::full_array_id);
+  std::cout << "[xdna_aie_array] part_info:"
+            << " partition_id=0x" << std::hex << part_info.partition_id << std::dec
+            << " start_col=" << (unsigned)part_info.start_column
+            << " num_cols=" << (unsigned)part_info.num_columns
+            << " base_addr=0x" << std::hex << part_info.base_address << std::dec
+            << " full_array_id=0x" << std::hex << xrt_core::edge::aie::full_array_id << std::dec
+            << std::endl;
+
   if (part_info.partition_id != xrt_core::edge::aie::full_array_id) {
+    std::cout << "[xdna_aie_array] calling XAie_SetupPartitionConfig(base=0x%lx, start=%u, num=%u)"
+              << " base=0x" << std::hex << part_info.base_address << std::dec
+              << " start=" << (unsigned)part_info.start_column
+              << " num=" << (unsigned)part_info.num_columns
+              << std::endl;
     AieRC rc1;
     if ((rc1 = XAie_SetupPartitionConfig(&dev_inst_obj, part_info.base_address, part_info.start_column, part_info.num_columns)) != XAIE_OK)
       throw xrt_core::error(-EINVAL, std::string("Failed to setup AIE Partition (rc=") +
                             std::to_string(rc1) + ", err=" + std::to_string(EINVAL) + ": " +
                             errno_to_str(EINVAL) + ")");
+    std::cout << "[xdna_aie_array] XAie_SetupPartitionConfig OK" << std::endl;
+  } else {
+    std::cout << "[xdna_aie_array] partition_id==full_array_id, skipping XAie_SetupPartitionConfig" << std::endl;
   }
 
   // Get AIE partition FD from kernel via ioctl
+  std::cout << "[xdna_aie_array] calling get_aie_partition_fd" << std::endl;
   int aie_part_fd = get_aie_partition_fd(hwctx_obj);
   if (aie_part_fd < 0)
     throw xrt_core::error(aie_part_fd, std::string("Failed to get AIE partition FD: ") +
                           std::to_string(aie_part_fd));
 
+  std::cout << "[xdna_aie_array] aie_part_fd=" << aie_part_fd << std::endl;
   fd = aie_part_fd;
   ConfigPtr.PartProp.Handle = fd;
 
+  std::cout << "[xdna_aie_array] XAie_CfgInitialize: ConfigPtr.NumCols=" << (unsigned)ConfigPtr.NumCols
+            << " aie_part_fd=" << aie_part_fd << std::endl;
   AieRC rc;
   if ((rc = XAie_CfgInitialize(&dev_inst_obj, &ConfigPtr)) != XAIE_OK)
     throw xrt_core::error(-EINVAL, std::string("Failed to initialize AIE configuration (rc=") +
                           std::to_string(rc) + ", err=" + std::to_string(EINVAL) + ": " +
                           errno_to_str(EINVAL) + ")");
 
+  std::cout << "[xdna_aie_array] XAie_CfgInitialize OK" << std::endl;
   dev_inst = &dev_inst_obj;
 }
 

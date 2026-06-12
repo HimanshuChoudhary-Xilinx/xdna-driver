@@ -86,6 +86,15 @@ struct ve2_sched_entry {
 	struct list_head		list;
 	struct amdxdna_ctx		*hwctx;
 	bool				in_list;
+	/*
+	 * Set by ve2_hwctx_fini() under pending_lock before removing the
+	 * entry.  Once set, ve2_detach_hwctx_from_partition() (PASS-1)
+	 * will NOT re-enqueue this entry even if the partition is reclaimed.
+	 * This prevents the "ghost re-enqueue" race where PASS-1 puts a
+	 * dying hwctx back into the pending list after fini already removed
+	 * it, causing the next scheduler pass to access freed priv data.
+	 */
+	bool				dying;
 	u64				pending_cmd_index;
 };
 
@@ -108,6 +117,7 @@ struct amdxdna_ctx_priv {
 	/* Dynamic scheduling fields */
 	struct ve2_sched_entry		sched_entry; /* Entry for device-level scheduler */
 	struct amdxdna_mgmtctx		*mgmtctx; /* Currently assigned partition (NULL if not assigned) */
+	int				aie_part_fd; /* Shim-side AIE partition FD, or -1 */
 };
 
 struct amdxdna_dev_priv {

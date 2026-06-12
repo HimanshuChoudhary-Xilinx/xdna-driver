@@ -176,8 +176,8 @@ xdna_hwctx(const device_xdna* dev, const xrt::xclbin& xclbin, const xrt::hw_cont
   set_doorbell(arg.umq_doorbell);
 
   auto data = m_device->get_axlf_section(AIE_TRACE_METADATA, xclbin.get_uuid());
-  if (data.first && data.second)
-    m_aie_array = std::make_shared<xdna_aie_array>(m_device, this);
+  //if (data.first && data.second)
+  //  m_aie_array = std::make_shared<xdna_aie_array>(m_device, this);
 
   m_hwq->bind_hwctx(this);
 

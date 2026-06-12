@@ -817,9 +817,11 @@ static int ve2_get_aie_part_fd(struct amdxdna_client *client,
 		XDNA_DBG(xdna, "aie_part_fd: allocating 36-col partition hwctx_id=%u pid=%u",
 			 ctx->id, ctx->client->pid);
 
+		XDNA_DBG(xdna, "HIMANSHU: start=%u (partition_size=%u)",
+			ctx->qos.user_start_col, ctx->num_tiles);
 		/* Override to 36 columns (full device) for applications that expect full partition */
-		ctx->num_tiles = 36;
-		ctx->qos.user_start_col = 0;
+		//ctx->num_tiles = 36;
+		//ctx->qos.user_start_col = 0;
 		ret = ve2_xrs_request(xdna, ctx);
 		if (ret) {
 			/* Restore original value on failure */
@@ -846,9 +848,13 @@ static int ve2_get_aie_part_fd(struct amdxdna_client *client,
 		goto unlock;
 	}
 
+	/* Track the FD so reclamation can close it to release the partition refcount */
+	nhwctx->aie_part_fd = aie_fd;
+
 	if (copy_to_user(u64_to_user_ptr(args->buffer), &aie_fd, sizeof(aie_fd))) {
 		XDNA_ERR(xdna, "Failed to copy AIE partition FD to user");
 		close_fd(aie_fd);
+		nhwctx->aie_part_fd = -1;
 		ret = -EFAULT;
 		goto unlock;
 	}

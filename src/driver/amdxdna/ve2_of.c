@@ -433,6 +433,44 @@ static void ve2_scheduler_work_handler(struct work_struct *work)
 
 	list_for_each_entry_safe(entry, next, &xdna_hdl->pending_hwctx_list, list) {
 		hwctx = entry->hwctx;
+
+		/*
+		 * Safety check 1: dying flag.  ve2_hwctx_fini() sets dying=true
+		 * under pending_lock before removing the entry.  If PASS-1 in
+		 * ve2_detach_hwctx_from_partition re-enqueued this entry before
+		 * fini could remove it, the dying flag prevents fini from
+		 * missing it (fini also checks in_list under the lock).
+		 * Here we double-check: if dying is set, the entry is stale and
+		 * should not be processed — remove it and skip.
+		 */
+		if (entry->dying) {
+			pr_warn("amdxdna: sched_work: hwctx=%p entry is dying, removing "
+				"stale pending entry (submitted=%llu completed=%llu)\n",
+				hwctx, hwctx->submitted, hwctx->completed);
+			list_del_init(&entry->list);
+			entry->in_list = false;
+			continue;
+		}
+
+		/*
+		 * Safety check 2: priv NULL.  ve2_hwctx_fini() sets priv=NULL
+		 * at the very end.  Should not happen if the dying flag works
+		 * correctly, but guard anyway to avoid a NULL-deref crash.
+		 */
+		if (!hwctx->priv) {
+			pr_err("amdxdna: sched_work: hwctx=%p has NULL priv despite dying=false "
+			       "— stale entry, removing (submitted=%llu completed=%llu)\n",
+			       hwctx, hwctx->submitted, hwctx->completed);
+			list_del_init(&entry->list);
+			entry->in_list = false;
+			continue;
+		}
+
+		printk("HIMANSHU sched_work entry: hwctx=%p priv=%p submitted=%llu completed=%llu "
+		       "cmd_idx=%llu mgmtctx=%p dying=%d\n",
+		       hwctx, hwctx->priv, hwctx->submitted, hwctx->completed,
+		       entry->pending_cmd_index, hwctx->priv->mgmtctx, entry->dying);
+
 		/* Check if hwctx already has a partition assigned */
 		if (!hwctx->priv->mgmtctx) {
 			/* No partition assigned yet - call ve2_xrs_request */
@@ -444,16 +482,22 @@ static void ve2_scheduler_work_handler(struct work_struct *work)
 
 			ret = ve2_xrs_request(xdna, hwctx);
 			if (ret) {
-				/* XRS allocation failed, leave in pending list for retry */
-				XDNA_ERR(xdna,
-					 "sched_work: hwctx=%p partition request failed ret=%d",
+				/*
+				 * No idle columns available yet — leave hwctx in
+				 * the pending list.  ve2_scheduler_work() will
+				 * queue_work() here again each time a partition
+				 * signals firmware-idle, so this path is retried
+				 * automatically without polling.
+				 */
+				XDNA_DBG(xdna,
+					 "sched_work: hwctx=%p waiting for idle columns (ret=%d)",
 					 hwctx, ret);
 				mutex_lock(&xdna_hdl->pending_lock);
 				continue;
 			}
 
 			mgmtctx = hwctx->priv->mgmtctx;
-			XDNA_DBG(xdna, "sched_work: hwctx=%p got partition [%u,%u)",
+			printk("HIMANSHU sched_work: hwctx=%p got partition [%u,%u)",
 				 hwctx, hwctx->priv->start_col, hwctx->priv->num_col);
 
 			/* Auto-select memory bitmap based on start_col */
@@ -634,7 +678,7 @@ static void ve2_fini(struct amdxdna_dev *xdna)
 	for (col = 0; col < xdna_hdl->aie_dev_info.cols; col++) {
 		struct amdxdna_mgmtctx *mgmtctx = &xdna_hdl->ve2_mgmtctx[col];
 
-		if (mgmtctx->mgmt_aiedev)
+		if (!IS_ERR_OR_NULL(mgmtctx->mgmt_aiedev))
 			ve2_mgmt_destroy_partition(mgmtctx);
 	}
 

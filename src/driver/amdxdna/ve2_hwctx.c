@@ -248,6 +248,10 @@ static void hsa_queue_commit_slot(struct amdxdna_dev *xdna, struct amdxdna_ctx *
 			break;
 
 		header->write_index++;
+		printk(KERN_INFO
+		       "amdxdna: HSA write_index++ hwctx=%p hwctx_id=%u commit_seq=%llu ring_slot=%u write_index=%llu pid=%d\n",
+		       hwctx, hwctx->id, (unsigned long long)seq, next_idx,
+		       (unsigned long long)header->write_index, (int)hwctx->client->pid);
 	}
 	/* Sync write_index after writing (device will read) */
 	hsa_queue_sync_write_index_for_write(queue);
@@ -994,8 +998,8 @@ int ve2_cmd_submit(struct amdxdna_sched_job *job, u32 *syncobj_hdls,
 	 * This is the single point of scheduling for both partition allocation
 	 * and command scheduling. ALL commands go through device scheduler workqueue.
 	 */
-	XDNA_DBG(xdna, "sched_submit: hwctx=%p seq=%llu pid=%d num_col=%u has_partition=%d",
-		 hwctx, *seq, hwctx->client->pid, hwctx->priv->num_col,
+	printk("HIMANSHU sched_submit: hwctx=%p seq=%llu total_submitted=%llu pid=%d num_col=%u has_partition=%d",
+		 hwctx, *seq, hwctx->submitted, hwctx->client->pid, hwctx->priv->num_col,
 		 !!hwctx->priv->mgmtctx);
 
 	mutex_lock(&xdna_hdl->pending_lock);
@@ -1410,7 +1414,7 @@ out:
 	trace_amdxdna_trace_point("XRT_PROFILING_TRACE_EXIT",
 				  hwctx->client->pid, hwctx->priv->start_col,
 				  hwctx->priv->id, seq);
-	XDNA_DBG(xdna, "cmd_wait: exit seq=%llu hwctx=%p ret=%d pid=%d",
+	printk("HIMANSHU cmd_wait: exit seq=%llu hwctx=%p ret=%d pid=%d",
 		 (u64)seq, hwctx, ret, hwctx->client->pid);
 	XDNA_DBG(xdna, "wait_cmd ret:%d", ret);
 	/* 0 is success, others are timeout */
@@ -1476,6 +1480,7 @@ int ve2_hwctx_init(struct amdxdna_ctx *hwctx)
 	priv->sched_entry.in_list = false;
 	priv->sched_entry.pending_cmd_index = 0;
 	priv->mgmtctx = NULL;
+	priv->aie_part_fd = -1;
 
 #if 0
 	ret = ve2_xrs_request(xdna, hwctx);
@@ -1486,7 +1491,40 @@ int ve2_hwctx_init(struct amdxdna_ctx *hwctx)
 
 	/* Auto-select memory bitmap based on start_col */
 	ve2_auto_select_mem_bitmap(xdna, hwctx);
+#else
+	hwctx->priv->start_col = hwctx->qos.user_start_col;
+	hwctx->priv->num_col = hwctx->num_tiles;
+	/* Also set ctx-level fields read by ve2_query_ctx_status_array() which
+	 * the shim uses to build partition_info for XAie_SetupPartitionConfig().
+	 * With lazy XRS allocation these ctx fields are never populated otherwise.
+	 */
+	hwctx->start_col = (hwctx->qos.user_start_col != USER_START_COL_NOT_REQUESTED) ?
+			   hwctx->qos.user_start_col : 0;
+	hwctx->num_col = hwctx->num_tiles;
+	XDNA_INFO(xdna, "hwctx_init: start_col=%u num_col=%u (lazy alloc)",
+		  hwctx->start_col, hwctx->num_col);
 #endif
+
+	/*
+	 * Allocate hwctx_config early — before any CONFIG_HWCTX ioctl arrives.
+	 *
+	 * With lazy XRS allocation, ve2_xrs_request() is not called during init;
+	 * it runs later in the scheduler workqueue on first command submission.
+	 * However, the shim's xdna_hwctx constructor immediately issues a
+	 * CONFIG_HWCTX(OPCODE_TIMEOUT) ioctl, which calls ve2_hwctx_config_op_timeout()
+	 * and iterates nhwctx->hwctx_config[].  If the array is not allocated yet
+	 * that is a NULL dereference crash.
+	 *
+	 * Allocate here with num_tiles entries (== num_col under lazy alloc).
+	 * ve2_xrs_request() skips re-allocation if the pointer is already set.
+	 */
+	priv->hwctx_config = kcalloc(hwctx->num_tiles, sizeof(*priv->hwctx_config), GFP_KERNEL);
+	if (!priv->hwctx_config) {
+		XDNA_ERR(xdna, "hwctx_init: failed to allocate hwctx_config for %u cols",
+			 hwctx->num_tiles);
+		ret = -ENOMEM;
+		goto cleanup_xrs;
+	}
 
 	/* One host_queue entry per hwctx */
 	ret = ve2_create_host_queue(xdna, hwctx, &priv->hwctx_hsa_queue);
@@ -1511,6 +1549,8 @@ int ve2_hwctx_init(struct amdxdna_ctx *hwctx)
 
 	XDNA_DBG(xdna, "hwctx_init: ready hwctx=%p id=%llu pid=%d",
 		 hwctx, priv->id, hwctx->client->pid);
+	printk("HIMANSHU hwctx_init: start_col=%u num_col=%u (lazy alloc) pid=%d hwctx=%p",
+			hwctx->start_col, hwctx->num_col, hwctx->client->pid, hwctx);
 
 	trace_amdxdna_trace_point("XRT_PROFILING_TRACE_EXIT",
 				  hwctx->client->pid, priv->start_col, priv->id, 0);
@@ -1519,6 +1559,8 @@ int ve2_hwctx_init(struct amdxdna_ctx *hwctx)
 cleanup_xrs:
 	/* Releases XRS and partition (ve2_mgmt_destroy_partition calls ve2_xrs_release). */
 	ve2_xrs_release(xdna, hwctx);
+	kfree(priv->hwctx_config);
+	priv->hwctx_config = NULL;
 cleanup_priv:
 	kfree(hwctx->priv);
 	hwctx->priv = NULL;
@@ -1536,18 +1578,108 @@ void ve2_hwctx_fini(struct amdxdna_ctx *hwctx)
 	int idx;
 
 	trace_amdxdna_trace_point("XRT_PROFILING_TRACE_ENTER",
-				  hwctx->client->pid, nhwctx->start_col, nhwctx->id, 0);
+			  hwctx->client->pid, nhwctx->start_col, nhwctx->id, 0);
 	XDNA_DBG(xdna, "hwctx_fini: hwctx=%p id=%llu start_col=%u num_col=%u pid=%d",
 		 hwctx, nhwctx->id, nhwctx->start_col, nhwctx->num_col, hwctx->client->pid);
 
-	/* Remove from pending list if present */
-	if (nhwctx->sched_entry.in_list) {
+	/*
+	 * Diagnostic: log close-time command accounting so we can tell
+	 * whether the hwctx was destroyed with commands still in flight.
+	 * submitted > completed means pending_count commands never got a
+	 * completion fence signal — the hwctx was closed "early".
+	 */
+	{
+		u64 pending_count = hwctx->submitted - hwctx->completed;
+
+		printk("HIMANSHU hwctx_close: hwctx=%p pid=%d submitted=%llu completed=%llu "
+		       "pending=%llu in_sched_list=%d start_col=%u num_col=%u mgmtctx=%p\n",
+		       hwctx, hwctx->client->pid,
+		       hwctx->submitted, hwctx->completed, pending_count,
+		       nhwctx->sched_entry.in_list,
+		       nhwctx->start_col, nhwctx->num_col,
+		       nhwctx->mgmtctx);
+
+		if (pending_count)
+			pr_warn("amdxdna: hwctx=%p closed with %llu in-flight commands "
+				"(submitted=%llu completed=%llu) – commands will be abandoned\n",
+				hwctx, pending_count,
+				hwctx->submitted, hwctx->completed);
+	}
+
+	/*
+	 * Remove this hwctx from the device-level pending scheduler list.
+	 *
+	 * Always lock before reading in_list: the scheduler sets in_list=false
+	 * only while holding pending_lock, so the check outside the lock was a
+	 * TOCTOU race.
+	 */
+	{
 		struct amdxdna_dev_hdl *xdna_hdl = xdna->dev_handle;
 
 		mutex_lock(&xdna_hdl->pending_lock);
-		list_del_init(&nhwctx->sched_entry.list);
-		nhwctx->sched_entry.in_list = false;
+		/*
+		 * Mark dying FIRST (still under pending_lock).  Any concurrent
+		 * ve2_detach_hwctx_from_partition() that holds or later acquires
+		 * pending_lock will see dying=true and skip the re-enqueue, so
+		 * this hwctx cannot be put back into the pending list after we
+		 * remove it here.
+		 */
+		nhwctx->sched_entry.dying = true;
+		if (nhwctx->sched_entry.in_list) {
+			printk("HIMANSHU hwctx_fini_remove: hwctx=%p was in sched pending list, "
+			       "removing (submitted=%llu completed=%llu)\n",
+			       hwctx, hwctx->submitted, hwctx->completed);
+			list_del_init(&nhwctx->sched_entry.list);
+			nhwctx->sched_entry.in_list = false;
+		} else {
+			printk("HIMANSHU hwctx_fini_noremove: hwctx=%p NOT in sched list "
+			       "(scheduler dequeued it or was never enqueued; submitted=%llu completed=%llu)\n",
+			       hwctx, hwctx->submitted, hwctx->completed);
+		}
 		mutex_unlock(&xdna_hdl->pending_lock);
+
+		/*
+		 * The device scheduler (ve2_scheduler_work_handler) may have
+		 * already dequeued this hwctx from pending_hwctx_list and
+		 * released pending_lock — yet still be inside ve2_xrs_request()
+		 * or ve2_mgmt_schedule_cmd() with a live hwctx->priv pointer.
+		 *
+		 * Root cause of the NULL-pointer oops (offset 0x218 = mgmtctx
+		 * field of amdxdna_ctx_priv):
+		 *   1. is_partition_idle=1 → firmware done → app closes FD
+		 *   2. ve2_hwctx_fini() frees hwctx->priv / sets it to NULL
+		 *   3. scheduler still in ve2_xrs_request(): nhwctx = hwctx->priv
+		 *      → NULL → str x24,[x21,#0x218] → oops
+		 *
+		 * flush_workqueue() drains any currently-executing scheduler pass
+		 * before we touch hwctx->priv.  No deadlock risk: this function
+		 * runs in process context and the scheduler never calls us.
+		 */
+		/*
+		 * flush_workqueue() drains any CURRENTLY-RUNNING scheduler pass
+		 * that may still hold a reference to this hwctx->priv (e.g. it
+		 * dequeued the entry and is inside ve2_xrs_request()).
+		 *
+		 * With dying=true set above:
+		 *  - The running pass will see dying=true and skip this entry.
+		 *  - ve2_detach_hwctx_from_partition() (PASS-1) will NOT re-
+		 *    enqueue this entry.
+		 * After flush_workqueue() returns, no scheduler code touches
+		 * this hwctx's priv, so it is safe to free.
+		 *
+		 * NOTE: flush_workqueue only waits for work items that were
+		 * ALREADY QUEUED at the time of call.  Work items triggered
+		 * after this call (e.g. by a later IRQ) see dying=true and
+		 * will skip this entry, so there is no window where priv is
+		 * freed while a later pass accesses it.
+		 */
+		printk("HIMANSHU hwctx_fini_flush: hwctx=%p calling flush_workqueue "
+		       "(dying=true, in_list=%d)\n", hwctx, nhwctx->sched_entry.in_list);
+		if (xdna_hdl->sched_wq)
+			flush_workqueue(xdna_hdl->sched_wq);
+		printk("HIMANSHU hwctx_fini_flush: hwctx=%p flush_workqueue done "
+		       "in_list=%d dying=%d — safe to free priv\n",
+		       hwctx, nhwctx->sched_entry.in_list, nhwctx->sched_entry.dying);
 	}
 
 	if (enable_polling) {

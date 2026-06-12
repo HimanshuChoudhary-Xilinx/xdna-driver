@@ -199,6 +199,7 @@ static int allocate_partition_exclusive(struct solver_state *xrs,
 	/* Add to resource group list and update bitmap */
 	list_add_tail(&pt_node->list, &xrs->rgp.pt_node_list);
 	xrs->rgp.npartition_node++;
+	drm_dbg(xrs->cfg.ddev, "HIMANSHU set bitmap for col=%u ncols=%u\n", pt_node->start_col, pt_node->ncols);
 	bitmap_set(xrs->rgp.resbit, pt_node->start_col, pt_node->ncols);
 
 	snode->pt_node = pt_node;
@@ -326,8 +327,10 @@ static int allocate_partition_shared(struct solver_state *xrs,
 		}
 
 		drm_dbg(xrs->cfg.ddev,
-			"Requested shared partition from user request at col=%u\n", candidate_col);
+			"Requested shared partition from user request at col=%u ncols=%u\n", candidate_col, ncols);
 		is_free = is_partition_free(xrs, candidate_col, ncols);
+		drm_dbg(xrs->cfg.ddev,
+			"Requested shared partition from user request is_free=%d\n", is_free);
 	}
 
 	/* STEP 2: Allocate new partition if unused */
@@ -341,6 +344,7 @@ static int allocate_partition_shared(struct solver_state *xrs,
 		list_add_tail(&pt_node->list, &xrs->rgp.pt_node_list);
 		xrs->rgp.npartition_node++;
 		snode->pt_node = pt_node;
+		drm_dbg(xrs->cfg.ddev, "HIMANSHU set bitmap for new shared partition at col=%u ncols=%u\n", pt_node->start_col, pt_node->ncols);
 		bitmap_set(xrs->rgp.resbit, pt_node->start_col, pt_node->ncols);
 		return 0;
 	}
@@ -531,6 +535,7 @@ int xrs_reclaim_partition(void *hdl, u32 start_col, u32 ncols, struct xrs_action
 			/* Remove partition node from list and free */
 			list_del(&pt_node->list);
 			rgp->npartition_node--;
+			drm_dbg(xrs->cfg.ddev, "HIMANSHU clear bitmap for col=%u ncols=%u\n", pt_node->start_col, pt_node->ncols);
 			bitmap_clear(rgp->resbit, pt_node->start_col, pt_node->ncols);
 			kfree(pt_node);
 

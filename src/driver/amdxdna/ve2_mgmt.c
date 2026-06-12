@@ -7,6 +7,10 @@
 #include <linux/completion.h>
 #include <linux/atomic.h>
 #include <linux/delay.h>
+#include <linux/fdtable.h>
+#include <linux/sched.h>
+#include <linux/mm.h>
+#include <linux/mmap_lock.h>
 
 #include "amdxdna_ctx.h"
 #include "ve2_of.h"
@@ -196,11 +200,32 @@ static void ve2_detach_hwctx_from_partition(struct amdxdna_dev *xdna,
 
 	/* Clear hwctx's partition assignment */
 	nhwctx->mgmtctx = NULL;
+	/*
+	 * Also clear aie_dev: ve2_xrs_reclaim_partition()'s global scan only
+	 * finds hwctxs where nhwctx->mgmtctx == the reclaimed mgmtctx.  Since
+	 * we just cleared mgmtctx above, the scan would skip this hwctx and
+	 * leave nhwctx->aie_dev pointing at the (about-to-be-freed) AIE
+	 * partition device — a dangling pointer.  Clear it now so any code
+	 * that checks aie_dev before mgmtctx is reassigned sees NULL.
+	 */
+	nhwctx->aie_dev = NULL;
 	/* Note: Keep start_col/num_col so ve2_xrs_release can work */
 
 	/* Re-enqueue to scheduler pending list for rescheduling */
 	mutex_lock(&xdna_hdl->pending_lock);
-	if (!nhwctx->sched_entry.in_list) {
+	if (nhwctx->sched_entry.dying) {
+		/*
+		 * ve2_hwctx_fini() already marked this entry dying under
+		 * pending_lock, meaning the hwctx is being destroyed.  Do NOT
+		 * re-enqueue: doing so would put a ghost entry back into the
+		 * scheduler list after fini has freed priv, causing the next
+		 * scheduler pass to dereference NULL or freed memory.
+		 */
+		pr_warn("amdxdna: detach: hwctx=%p is dying, skipping re-enqueue "
+			"(submitted=%llu completed=%llu)\n",
+			hwctx, hwctx->submitted, hwctx->completed);
+	} else if (!nhwctx->sched_entry.in_list) {
+		printk("HIMANSHU detach_reenqueue: hwctx=%p re-enqueued to pending list\n", hwctx);
 		list_add_tail(&nhwctx->sched_entry.list, &xdna_hdl->pending_hwctx_list);
 		nhwctx->sched_entry.in_list = true;
 	}
@@ -233,92 +258,87 @@ static int ve2_try_reclaim_for_allocation(struct amdxdna_dev *xdna, u32 start_co
 	u32 reclaimed = 0;
 	u32 col;
 
-	struct amdxdna_mgmtctx *smallest_victim = NULL;
-	u32 smallest_size = U32_MAX;
-
 	XDNA_DBG(xdna, "reclaim: searching [%u,%u) preempt=%d", start_col, end_col, allow_preemption);
 
-	/* PASS 1: Try to reclaim idle partitions first */
+	/*
+	 * PASS 1: Cooperative idle reclaim.
+	 *
+	 * Reclaim every overlapping partition that the per-partition firmware
+	 * scheduler has confirmed is idle (is_partition_idle == 1).  This
+	 * flag is set by ve2_scheduler_work() when CERT signals no more work
+	 * and no other context is waiting — meaning the firmware has finished
+	 * the current command batch and it is safe to repurpose the columns.
+	 *
+	 * Crucially, this is a COOPERATIVE model:
+	 *  - Partitions that are actively processing commands
+	 *    (is_partition_idle == 0) are NEVER touched here.  Those hwctxs
+	 *    continue uninterrupted on their own columns.
+	 *  - Only partitions that have gone firmware-idle are reclaimed.
+	 *  - The displaced hwctx is re-enqueued to the pending list so it
+	 *    gets a fresh partition as soon as columns become available.
+	 *
+	 * For a large (e.g. 24-col) request competing with several small
+	 * (e.g. 4-col) partitions: each small partition signals idle
+	 * independently; every time one does, the device scheduler retries
+	 * the allocation.  Once ALL overlapping partitions have gone idle
+	 * (possibly at different times), PASS 1 reclaims them all and the
+	 * retry succeeds.
+	 */
 	for (col = 0; col < xdna_hdl->aie_dev_info.cols; col++) {
 		struct amdxdna_mgmtctx *mgmtctx = &xdna_hdl->ve2_mgmtctx[col];
+		struct amdxdna_ctx_command_fifo *c_ctx, *t_ctx;
 		u32 part_end;
 		bool is_idle;
 
-		/* Skip if no partition at this slot */
 		if (!mgmtctx->mgmt_aiedev)
 			continue;
 
 		part_end = mgmtctx->start_col + mgmtctx->ncol;
-
-		/* Check if partition overlaps with requested range */
 		if (mgmtctx->start_col >= end_col || part_end <= start_col)
-			continue; /* No overlap */
+			continue;
 
-		/* Check if partition is idle (FIFO empty) */
 		mutex_lock(&mgmtctx->ctx_lock);
-		is_idle = list_empty(&mgmtctx->ctx_command_fifo_head);
+		is_idle = mgmtctx->is_partition_idle;
 		mutex_unlock(&mgmtctx->ctx_lock);
 
-		if (is_idle) {
-			/* Idle partition - reclaim it */
-			XDNA_DBG(xdna, "reclaim: idle partition [%u,%u)", mgmtctx->start_col, part_end);
+		if (!is_idle)
+			continue;
 
-			if (ve2_xrs_reclaim_partition(xdna, mgmtctx->start_col, mgmtctx->ncol) == 0)
-				reclaimed++;
-		} else if (allow_preemption) {
-			/* Active partition - track as potential victim (pick smallest) */
-			if (mgmtctx->ncol < smallest_size) {
-				smallest_size = mgmtctx->ncol;
-				smallest_victim = mgmtctx;
-			}
-		}
-	}
+		XDNA_DBG(xdna, "reclaim: firmware-idle partition [%u,%u)", mgmtctx->start_col, part_end);
 
-	/* If we reclaimed any idle partitions, we're done */
-	if (reclaimed > 0) {
-		XDNA_DBG(xdna, "reclaim: freed %u idle partitions", reclaimed);
-		return reclaimed;
-	}
-
-	/* PASS 2: No idle partitions - preempt if allowed */
-	if (allow_preemption && smallest_victim) {
-		struct amdxdna_mgmtctx *mgmtctx = smallest_victim;
-		u32 part_end = mgmtctx->start_col + mgmtctx->ncol;
-		struct amdxdna_ctx_command_fifo *c_ctx, *t_ctx;
-		int detached = 0;
-
-		XDNA_INFO(xdna, "reclaim: preempting partition [%u,%u) size=%u",
-			  mgmtctx->start_col, part_end, mgmtctx->ncol);
-
-		/* Detach all hwctx from this partition and re-enqueue them */
+		/*
+		 * Detach any owner before destroying the partition.
+		 * is_partition_idle==1 implies the FIFO is empty and the
+		 * firmware has no outstanding work, but active_ctx may still
+		 * point at the last hwctx that used this partition.  Detaching
+		 * it here puts it back in the pending list so the device
+		 * scheduler can reassign it a new (or the same) partition later.
+		 */
 		mutex_lock(&mgmtctx->ctx_lock);
 
-		/* Detach active_ctx if present */
 		if (mgmtctx->active_ctx) {
-			ve2_detach_hwctx_from_partition(xdna, mgmtctx, mgmtctx->active_ctx);
-			detached++;
+			ve2_detach_hwctx_from_partition(xdna, mgmtctx,
+							mgmtctx->active_ctx);
 		}
-
-		/* Detach all contexts in FIFO */
-		list_for_each_entry_safe(c_ctx, t_ctx, &mgmtctx->ctx_command_fifo_head, list) {
+		/* Safety: drain any stale FIFO entries (should be empty) */
+		list_for_each_entry_safe(c_ctx, t_ctx,
+					 &mgmtctx->ctx_command_fifo_head, list) {
 			list_del(&c_ctx->list);
 			ve2_detach_hwctx_from_partition(xdna, mgmtctx, c_ctx->ctx);
 			kfree(c_ctx);
-			detached++;
 		}
 
 		mutex_unlock(&mgmtctx->ctx_lock);
 
-		XDNA_DBG(xdna, "reclaim: detached %d hwctx, reclaiming partition", detached);
-
-		/* Now reclaim the partition */
-		if (ve2_xrs_reclaim_partition(xdna, mgmtctx->start_col, mgmtctx->ncol) == 0)
-			reclaimed = 1;
+		if (ve2_xrs_reclaim_partition(xdna, mgmtctx->start_col,
+					      mgmtctx->ncol) == 0)
+			reclaimed++;
 		else
-			XDNA_ERR(xdna, "reclaim: failed to reclaim partition after preemption");
+			XDNA_ERR(xdna, "reclaim: failed to reclaim idle [%u,%u)",
+				 mgmtctx->start_col, part_end);
 	}
 
-	XDNA_DBG(xdna, "reclaim: total %u partitions (preempt=%d)", reclaimed, allow_preemption);
+	XDNA_DBG(xdna, "reclaim: total %u firmware-idle partitions", reclaimed);
 	return reclaimed;
 }
 
@@ -330,7 +350,7 @@ int ve2_xrs_request(struct amdxdna_dev *xdna, struct amdxdna_ctx *hwctx)
 	struct amdxdna_ctx_priv *nhwctx = NULL;
 	struct alloc_requests *xrs_req;
 	int reclaim_attempts = 0;
-	const int MAX_RECLAIM_ATTEMPTS = 2;
+	const int MAX_RECLAIM_ATTEMPTS = 1;
 	int ret;
 
 	if (!xrs)
@@ -344,7 +364,8 @@ int ve2_xrs_request(struct amdxdna_dev *xdna, struct amdxdna_ctx *hwctx)
 		mutex_unlock(&xrs->xrs_lock);
 		return -ENOMEM;
 	}
-
+    XDNA_DBG(xdna, "XRS request: ncols=%u (partition_size=%d, num_tiles=%u)",
+		 xrs_req->cdo.ncols, partition_size, hwctx->num_tiles);
 	if (partition_size < hwctx->num_tiles)
 		xrs_req->cdo.ncols = hwctx->num_tiles;
 	else
@@ -388,38 +409,44 @@ int ve2_xrs_request(struct amdxdna_dev *xdna, struct amdxdna_ctx *hwctx)
 retry_allocation:
 	ret = xrs_allocate_resource(xrs, xrs_req, &load_act);
 	if (ret && reclaim_attempts < MAX_RECLAIM_ATTEMPTS) {
-		/* XRS allocation failed - try reclaiming overlapping idle partitions */
-		XDNA_INFO(xdna, "[XRS-REQUEST] Allocation failed ret=%d, attempting reclamation (attempt %d/%d)",
-			  ret, reclaim_attempts + 1, MAX_RECLAIM_ATTEMPTS);
-
-		/* Unlock XRS while reclaiming to avoid deadlock */
-		mutex_unlock(&xrs->xrs_lock);
-
-		/* Reclaim overlapping partitions for all candidate start columns
-		 * First attempt: only idle partitions (allow_preemption=false)
-		 * Second attempt: allow preemption of active partitions (allow_preemption=true)
+		/*
+		 * XRS allocation failed — columns are occupied.  Try to reclaim
+		 * any overlapping partitions that the firmware has confirmed are
+		 * idle (is_partition_idle == 1).  Partitions with active
+		 * firmware work are left untouched; the device scheduler will
+		 * retry automatically when each of those partitions signals idle.
 		 */
-		bool allow_preemption = (reclaim_attempts > 0);
 		int total_reclaimed = 0;
+
+		XDNA_INFO(xdna, "[XRS-REQUEST] Allocation failed ret=%d, trying idle reclaim",
+			  ret);
+
+		mutex_unlock(&xrs->xrs_lock);
 
 		for (int i = 0; i < xrs_req->cdo.cols_len; i++) {
 			u32 candidate_col = xrs_req->cdo.start_cols[i];
-			int reclaimed = ve2_try_reclaim_for_allocation(xdna, candidate_col,
-									xrs_req->cdo.ncols,
-									allow_preemption);
-			total_reclaimed += reclaimed;
+
+			total_reclaimed += ve2_try_reclaim_for_allocation(xdna, candidate_col,
+									  xrs_req->cdo.ncols,
+									  false);
 		}
 
-		/* Re-lock XRS before retrying allocation */
 		mutex_lock(&xrs->xrs_lock);
+		reclaim_attempts++;
 
 		if (total_reclaimed > 0) {
-			reclaim_attempts++;
-			XDNA_INFO(xdna, "[XRS-REQUEST] Reclaimed %d partitions, retrying allocation", total_reclaimed);
+			XDNA_INFO(xdna, "[XRS-REQUEST] Reclaimed %d idle partitions, retrying",
+				  total_reclaimed);
 			goto retry_allocation;
 		}
 
-		XDNA_ERR(xdna, "[XRS-REQUEST] No reclaimable partitions found");
+		/*
+		 * No idle columns available yet.  The caller (device scheduler)
+		 * will be re-triggered by ve2_scheduler_work() every time a
+		 * partition goes firmware-idle, so this hwctx will be
+		 * rescheduled automatically without busy-waiting.
+		 */
+		XDNA_DBG(xdna, "[XRS-REQUEST] No idle partitions available, will retry on next idle");
 	}
 
 	if (ret) {
@@ -437,19 +464,43 @@ retry_allocation:
 	}
 
 	nhwctx = hwctx->priv;
+	if (!nhwctx) {
+		/*
+		 * ve2_hwctx_fini() already ran for this hwctx (set priv=NULL)
+		 * but the stale pointer was still in the pending list.  Do not
+		 * write through the NULL pointer.  The scheduler's entry-level
+		 * NULL check in ve2_scheduler_work_handler is the primary guard;
+		 * this is a belt-and-suspenders defence for races inside
+		 * ve2_xrs_request() itself (e.g. after a PASS-1 reclaim retry).
+		 */
+		XDNA_ERR(xdna,
+			 "ve2_xrs_request: hwctx=%p priv=NULL after partition assignment "
+			 "– hwctx destroyed while scheduler held it (submitted=%llu completed=%llu)",
+			 hwctx, hwctx->submitted, hwctx->completed);
+		mutex_unlock(&xrs->xrs_lock);
+		ret = -EINVAL;
+		goto destroy_partition;
+	}
 	nhwctx->mgmtctx = mgmtctx;  /* Assign partition to hwctx */
         nhwctx->start_col = mgmtctx->start_col;
         nhwctx->num_col = mgmtctx->ncol;
 	nhwctx->aie_dev = mgmtctx->mgmt_aiedev;
 	nhwctx->args = &mgmtctx->args;
-	/* Allocate hwctx_config array based on number of columns for this context */
-	nhwctx->hwctx_config = kcalloc(nhwctx->num_col,
-				       sizeof(*nhwctx->hwctx_config), GFP_KERNEL);
+	/*
+	 * Allocate hwctx_config array if not already done.
+	 * Under lazy allocation, ve2_hwctx_init() pre-allocates this with
+	 * num_tiles entries so CONFIG_HWCTX ioctls can arrive before the first
+	 * command submission.  Only allocate here if it wasn't pre-allocated.
+	 */
 	if (!nhwctx->hwctx_config) {
-		XDNA_ERR(xdna, "Failed to allocate hwctx_config");
-		mutex_unlock(&xrs->xrs_lock);
-		ret = -ENOMEM;
-		goto destroy_partition;
+		nhwctx->hwctx_config = kcalloc(nhwctx->num_col,
+					       sizeof(*nhwctx->hwctx_config), GFP_KERNEL);
+		if (!nhwctx->hwctx_config) {
+			XDNA_ERR(xdna, "Failed to allocate hwctx_config");
+			mutex_unlock(&xrs->xrs_lock);
+			ret = -ENOMEM;
+			goto destroy_partition;
+		}
 	}
 
         hwctx->start_col = nhwctx->start_col;
@@ -464,6 +515,13 @@ destroy_partition:
 	ve2_mgmt_destroy_partition(mgmtctx);
 xrs_release:
 	xrs_release_resource(xrs, (uintptr_t)hwctx, &load_act);
+	/* Clear priv XRS fields so ve2_hwctx_fini doesn't call ve2_xrs_release
+	 * a second time on a solver_node that no longer exists.
+	 */
+	if (hwctx->priv) {
+		hwctx->priv->start_col = 0;
+		hwctx->priv->num_col = 0;
+	}
 free_start_cols:
 	kfree(xrs_req->cdo.start_cols);
 free_xrs_req:
@@ -620,13 +678,23 @@ ve2_response_ctx_switch_req(struct amdxdna_mgmtctx *mgmtctx)
 	list_for_each_entry_safe(c_ctx, t_ctx, &mgmtctx->ctx_command_fifo_head, list) {
 		if (mgmtctx->is_idle_due_to_context == 1) {
 			hwctx = c_ctx->ctx;
-			XDNA_DBG(xdna, "NEW context to be schedule next: %p\n", hwctx);
 			mgmtctx->is_partition_idle = 0;
-			ve2_mgmt_handshake_init(mgmtctx->xdna, hwctx);
-			if (mgmtctx->active_ctx == hwctx)
-				break;
-
-			mgmtctx->active_ctx = hwctx;
+			/*
+			 * Only re-initialize the partition when the context at
+			 * the head of the FIFO is DIFFERENT from the one that
+			 * was previously active.  If the same hwctx is coming
+			 * back (e.g. it was the only one and the firmware went
+			 * idle momentarily), skip the expensive handshake
+			 * re-init — the firmware state is still valid.
+			 */
+			if (mgmtctx->active_ctx != hwctx) {
+				XDNA_DBG(xdna, "ctx switch: %p -> %p, re-init",
+					 mgmtctx->active_ctx, hwctx);
+				ve2_mgmt_handshake_init(mgmtctx->xdna, hwctx);
+				mgmtctx->active_ctx = hwctx;
+			} else {
+				XDNA_DBG(xdna, "ctx switch: same hwctx %p, skip re-init", hwctx);
+			}
 		}
 
 		if (t_ctx && c_ctx->ctx != t_ctx->ctx)
@@ -664,12 +732,12 @@ int ve2_mgmt_schedule_cmd(struct amdxdna_dev *xdna, struct amdxdna_ctx *hwctx,
 		mutex_unlock(&mgmtctx->ctx_lock);
 		return ret;
 	}
-	XDNA_DBG(xdna, "ve2_fifo_enqueue ok cmd_idx=%llu hwctx=%p",
+	printk("HIMANSHU SCH ve2_fifo_enqueue ok cmd_idx=%llu hwctx=%p",
 		 (unsigned long long)command_index, hwctx);
 
 	if (!mgmtctx->active_ctx) {
 		mgmtctx->is_partition_idle = 0;
-		XDNA_DBG(xdna, "First command for partition, initializing hwctx %p", hwctx);
+		printk("HIMANSHU SCH SWITCH First command for partition, initializing hwctx %p", hwctx);
 		/* First command request. Initiate the handshake */
 		ve2_mgmt_handshake_init(xdna, hwctx);
 		mgmtctx->active_ctx = hwctx;
@@ -678,17 +746,24 @@ int ve2_mgmt_schedule_cmd(struct amdxdna_dev *xdna, struct amdxdna_ctx *hwctx,
 			mgmtctx->is_partition_idle = 0;
 			XDNA_DBG(xdna, "Context switch: active=%p -> new=%p (partition idle)",
 				 mgmtctx->active_ctx, hwctx);
+			printk("HIMANSHU SCH request Context switch: active=%p -> new=%p (partition idle)",
+				 mgmtctx->active_ctx, hwctx);
 			ve2_response_ctx_switch_req(mgmtctx);
 		} else {
 			XDNA_DBG(xdna, "Command queued: active=%p, pending=%p",
 				 mgmtctx->active_ctx, hwctx);
+			printk("HIMANSHU SCH Command queued: active=%p, pending=%p",
+				 mgmtctx->active_ctx, hwctx);
 		}
 	} else {
 		if (mgmtctx->is_idle_due_to_context == 1) {
+			printk("HIMANSHU SCH SWITCH is_idle_due_to_context=1, initializing hwctx %p", hwctx);
 			mgmtctx->is_idle_due_to_context = 0;
 			mgmtctx->is_partition_idle = 0;
 			ve2_mgmt_handshake_init(xdna, hwctx);
 			mgmtctx->active_ctx = hwctx;
+		} else {
+			printk("HIMANSHU SCH already active hwctx %p", hwctx);
 		}
 	}
 
@@ -697,8 +772,8 @@ int ve2_mgmt_schedule_cmd(struct amdxdna_dev *xdna, struct amdxdna_ctx *hwctx,
 	trace_amdxdna_trace_point("XRT_PROFILING_TRACE_EXIT",
 				  hwctx->client->pid, mgmtctx->start_col,
 				  hwctx->priv->id, (int)command_index);
-	XDNA_DBG(xdna,
-		 "schedule_cmd: exit command_index=%llu start_col=%u hwctx=%p pid=%d",
+	printk(
+		 "HIMANSHU schedule_cmd: exit command_index=%llu start_col=%u hwctx=%p pid=%d",
 		 (unsigned long long)command_index, mgmtctx->start_col, hwctx,
 		 hwctx->client->pid);
 
@@ -857,13 +932,15 @@ static void ve2_scheduler_work(struct work_struct *work)
 		if (!ve2_response_ctx_switch_req(mgmtctx)) {
 			mgmtctx->is_partition_idle = 1;
 			/*
-			 * no more command in fifo and Partition is IDLE, this can never happen
-			 * as we got queue_not_empty bit, that means active ctx should have more
-			 * commands.
+			 * Unexpected: queue_not_empty was set but no more
+			 * commands in FIFO.  Still signal idle to allow
+			 * cooperative reclamation by pending large allocations.
 			 */
 			XDNA_DBG(mgmtctx->xdna,
 				 "No more command in fifo and Partition is IDLE active hwctx:%p ------> ",
 				 mgmtctx->active_ctx);
+			queue_work(mgmtctx->xdna->dev_handle->sched_wq,
+				   &mgmtctx->xdna->dev_handle->sched_work);
 		}
 	} else if (ve2_check_idle(mgmtctx)) {
 		/*
@@ -875,6 +952,17 @@ static void ve2_scheduler_work(struct work_struct *work)
 		if (!ve2_response_ctx_switch_req(mgmtctx)) {
 			mgmtctx->is_partition_idle = 1;
 			XDNA_DBG(mgmtctx->xdna, "Partition now idle, no pending contexts");
+			/*
+			 * Wake the device-level scheduler.  A larger partition
+			 * request (e.g. 24-col) may be waiting in
+			 * pending_hwctx_list and needs these columns.  Kicking
+			 * the device scheduler here lets it retry the
+			 * allocation cooperatively: each small partition signals
+			 * idle independently, and once all columns the large
+			 * request needs are idle the allocation succeeds.
+			 */
+			queue_work(mgmtctx->xdna->dev_handle->sched_wq,
+				   &mgmtctx->xdna->dev_handle->sched_work);
 		}
 	} else {
 		XDNA_DBG(mgmtctx->xdna, "Scheduler: no action needed, active_ctx=%p",
@@ -1404,6 +1492,18 @@ ve2_create_mgmt_partition(struct amdxdna_dev *xdna,
 		/* Sequential reuse: partition exists from previous hwctx that finished */
 		XDNA_DBG(xdna, "partition_reuse: [%u,%u) already exists",
 			 load_act->part.start_col, load_act->part.ncols);
+		/*
+		 * The previous hwctx released this partition via ve2_xrs_release()
+		 * which sets is_partition_idle=1.  If we don't clear that flag here,
+		 * ve2_try_reclaim_for_allocation() PASS-1 will immediately see the
+		 * reused partition as "idle" and reclaim it from the new owner —
+		 * leaving nhwctx->aie_dev = NULL → crash in notify_fw_cmd_ready.
+		 */
+		mutex_lock(&mgmtctx->ctx_lock);
+		mgmtctx->is_partition_idle      = 0;
+		mgmtctx->is_context_req         = 0;
+		mgmtctx->is_idle_due_to_context = 0;
+		mutex_unlock(&mgmtctx->ctx_lock);
 		return mgmtctx;
 	}
 
@@ -1430,6 +1530,7 @@ ve2_create_mgmt_partition(struct amdxdna_dev *xdna,
 		if (IS_ERR(mgmtctx->mgmt_aiedev)) {
 			XDNA_ERR(xdna, "aie partition request failed for part id %d",
 				 request.partition_id);
+			mgmtctx->mgmt_aiedev = NULL;
 			return NULL;
 		}
 
@@ -1439,6 +1540,31 @@ ve2_create_mgmt_partition(struct amdxdna_dev *xdna,
 		mgmtctx->ncol = load_act->part.ncols;
 		mgmtctx->args.locs = NULL;
 		mgmtctx->args.num_tiles = 0;
+
+		/*
+		 * Reset all scheduler-state flags carried over from the
+		 * previous lifetime of this mgmtctx slot.
+		 *
+		 * ve2_mgmt_destroy_partition() clears active_ctx and
+		 * mgmt_aiedev but intentionally leaves the rest so that
+		 * cancel_work_sync / destroy_workqueue can finish cleanly.
+		 * When a brand-new partition is created here those stale
+		 * values become dangerous:
+		 *
+		 *   is_partition_idle = 1  (set by ve2_detach_hwctx_from_partition
+		 *                           during cooperative reclaim)
+		 *
+		 * Without this reset, PASS-1 in ve2_try_reclaim_for_allocation
+		 * sees the freshly-created partition as "already idle" and
+		 * immediately reclaims it from the hwctx that just obtained it,
+		 * leaving nhwctx->aie_dev = NULL → NULL-deref in
+		 * notify_fw_cmd_ready (ve2_partition_write NULL+0x48 oops).
+		 */
+		mgmtctx->active_ctx             = NULL;
+		mgmtctx->is_partition_idle      = 0;
+		mgmtctx->is_context_req         = 0;
+		mgmtctx->is_idle_due_to_context = 0;
+
 		mutex_init(&mgmtctx->ctx_lock);
 		mutex_init(&mgmtctx->async_errs_cache.lock);
 		memset(&mgmtctx->async_errs_cache.err, 0, sizeof(mgmtctx->async_errs_cache.err));
@@ -1537,7 +1663,11 @@ int ve2_xrs_release(struct amdxdna_dev *xdna, struct amdxdna_ctx *hwctx)
 	ret = xrs_release_resource(xdna->dev_handle->xrs_hdl, (uintptr_t)hwctx, &load_act);
         if (ret) {
                 mutex_unlock(&xrs->xrs_lock);
-                XDNA_ERR(xdna, "xrs_release failed ret=%d", ret);
+                /* ENOENT is expected when solver node was already freed by reclamation */
+                if (ret == -ENOENT)
+                        XDNA_DBG(xdna, "xrs_release: solver_node already freed (reclaimed), ret=%d", ret);
+                else
+                        XDNA_ERR(xdna, "xrs_release failed ret=%d", ret);
                 return ret;
         }
 
@@ -1554,63 +1684,197 @@ int ve2_xrs_release(struct amdxdna_dev *xdna, struct amdxdna_ctx *hwctx)
 }
 
 /*
+ * ve2_force_unmap_aie_file - Destroy all VMAs in current->mm that are backed
+ *                            by the given AIE partition file.
+ *
+ * When the shim calls mmap() on the AIE partition FD, the kernel's mmap path
+ * calls get_file() on the file, raising file->f_count to 2 (1 for the FD
+ * + 1 for the VMA's vm_file).  A subsequent close_fd() drops f_count back to
+ * 1, but the VMA still holds it, so the file's f_op->release() is never
+ * called.  That release() is what calls put_device() on the AIE partition
+ * device; without it, the device refcount never reaches 0 and the AIE
+ * aperture never clears the partition from its "in use" bitmap.
+ *
+ * By force-unmapping the VMA here (before close_fd), we drop the VMA's
+ * file reference.  Then close_fd() drops f_count to 0 → release() fires →
+ * put_device() → device refcount drops → aperture clears "in use".
+ *
+ * This only operates on current->mm, so it only helps for the common
+ * single-process case where all hwctx share the same PID.
+ */
+static void ve2_force_unmap_aie_file(struct file *aie_file)
+{
+	struct mm_struct *mm = current->mm;
+	struct vm_area_struct *vma;
+	unsigned long start, end;
+
+	if (!mm)
+		return;
+
+	for (;;) {
+		/* Scan for a VMA backed by this file (requires at least read lock) */
+		mmap_read_lock(mm);
+		start = end = 0;
+		for (vma = find_vma(mm, 0); vma; vma = find_vma(mm, vma->vm_end)) {
+			if (vma->vm_file == aie_file) {
+				start = vma->vm_start;
+				end = vma->vm_end;
+				break;
+			}
+		}
+		mmap_read_unlock(mm);
+
+		if (!start)
+			break; /* No more VMAs for this file */
+
+		pr_debug("amdxdna: ve2_force_unmap_aie_file: unmapping VMA [%lx, %lx)\n",
+			 start, end);
+		/* vm_munmap acquires mmap_write_lock internally; do NOT hold any mm lock here */
+		vm_munmap(start, end - start);
+	}
+}
+
+/*
  * ve2_xrs_reclaim_partition - Explicitly reclaim/destroy a partition
  *
  * This is called when we need to free up space for new allocations.
  * Unlike ve2_xrs_release which keeps partitions alive, this actually destroys them.
  *
- * IMPORTANT: After forcefully reclaiming, all affected hwctx will have their XRS
- * tracking (solver_nodes) deleted. We must clear their start_col/num_col fields
- * so ve2_hwctx_fini doesn't try to call ve2_xrs_release (which would fail with
- * "node not exist" error).
+ * The key challenge: aie_partition_get_fd() hands the shim an open file descriptor
+ * that holds a reference to the AIE partition in the AIE driver.  The shim then
+ * calls mmap() on that FD to access the AIE registers; this raises file->f_count
+ * to 2 (FD + VMA).  A bare close_fd() only drops f_count to 1 – the VMA keeps
+ * the file alive, the file's release() is never called, put_device() never fires,
+ * and the aperture's "in use" bitmap is never cleared.
+ *
+ * We therefore FIRST force-unmap the VMA (ve2_force_unmap_aie_file), THEN
+ * close_fd().  After both steps f_count reaches 0, release() fires, and
+ * aie_partition_release() in ve2_mgmt_destroy_partition() drops the device
+ * refcount to 0, letting the aperture free the columns.
+ *
+ * We do a global scan over ALL clients/contexts (not just mgmtctx->active_ctx)
+ * because once a command completes the scheduler clears active_ctx but the hwctx
+ * itself – and its open AIE FD – lives on until the application calls DESTROY_HWCTX.
+ * Using nhwctx->mgmtctx as the key reliably finds every hwctx that was assigned to
+ * this partition, regardless of idle/active state.
+ *
+ * close_fd() operates on the current task's file table, so it only works when the
+ * partition owner and the requester share the same process.  For the common
+ * single-process case (all hwctx in one PID) this covers every FD.
  */
 int ve2_xrs_reclaim_partition(struct amdxdna_dev *xdna, u32 start_col, u32 ncols)
 {
-        struct solver_state *xrs = xdna->dev_handle->xrs_hdl;
-        struct amdxdna_mgmtctx *mgmtctx = &xdna->dev_handle->ve2_mgmtctx[start_col];
-        struct xrs_action_load load_act = {0};
-        struct amdxdna_ctx_command_fifo *c_ctx;
-        struct amdxdna_ctx_priv *nhwctx;
-        int ret;
+	struct solver_state *xrs = xdna->dev_handle->xrs_hdl;
+	struct amdxdna_mgmtctx *mgmtctx = &xdna->dev_handle->ve2_mgmtctx[start_col];
+	struct xrs_action_load load_act = {0};
+	struct amdxdna_client *client;
+	struct amdxdna_ctx_priv *nhwctx;
+	struct amdxdna_ctx *hwctx;
+	unsigned long hwctx_id;
+	int idx, ret;
 
-        /*
-         * Before forcefully reclaiming XRS tracking, clear start_col/num_col
-         * for all hwctx that were using this partition. This prevents
-         * ve2_hwctx_fini from trying to call ve2_xrs_release on a
-         * solver_node that no longer exists.
-         */
-        mutex_lock(&mgmtctx->ctx_lock);
+	/*
+	 * Step 1: Global scan – for every hwctx currently assigned to this
+	 * partition (identified by nhwctx->mgmtctx == mgmtctx):
+	 *   a) Close the shim-side AIE FD so aie_partition_release() can
+	 *      actually free the partition (drop the FD reference).
+	 *   b) Clear start_col/num_col so ve2_hwctx_fini() won't try to call
+	 *      ve2_xrs_release() on an already-deleted solver node.
+	 *
+	 * This must be done WITHOUT holding mgmtctx->ctx_lock to avoid deadlock
+	 * with the srcu read lock (the comment in amdxdna_drm.h forbids waiting
+	 * on srcu while dev_lock/ctx_lock is held in some paths).
+	 */
+	list_for_each_entry(client, &xdna->client_list, node) {
+		idx = srcu_read_lock(&client->ctx_srcu);
+		amdxdna_for_each_ctx(client, hwctx_id, hwctx) {
+			if (!hwctx->priv)
+				continue;
+			nhwctx = hwctx->priv;
+			if (nhwctx->mgmtctx != mgmtctx)
+				continue;
 
-        /* Clear active_ctx's XRS fields if present */
-        if (mgmtctx->active_ctx) {
-                nhwctx = mgmtctx->active_ctx->priv;
-                nhwctx->start_col = 0;
-                nhwctx->num_col = 0;
-        }
+			/* Clear XRS fields – prevents double-release in hwctx_fini */
+			nhwctx->start_col = 0;
+			nhwctx->num_col = 0;
 
-        /* Clear XRS fields for all hwctx in FIFO */
-        list_for_each_entry(c_ctx, &mgmtctx->ctx_command_fifo_head, list) {
-                nhwctx = c_ctx->ctx->priv;
-                nhwctx->start_col = 0;
-                nhwctx->num_col = 0;
-        }
+			/*
+			 * Clear mgmtctx and aie_dev now, BEFORE the partition
+			 * device is released in Step 3.
+			 *
+			 * ve2_mgmt_destroy_partition() calls aie_partition_release()
+			 * → __fput_sync(apart->filep) → aie_part_release() →
+			 * aie_part_remove() → device_del() (devres freed, pkt_va
+			 * PTE cleared) + devm_kfree(apart) (struct freed).
+			 *
+			 * After that, nhwctx->aie_dev = &apart->dev is a dangling
+			 * pointer.  If the scheduler runs for this hwctx and finds
+			 * nhwctx->mgmtctx != NULL it skips ve2_xrs_request() and
+			 * calls ve2_mgmt_handshake_init(nhwctx->aie_dev) on the
+			 * freed struct → use-after-free → oops in aie_part_pm_ops.
+			 *
+			 * Setting both to NULL forces the scheduler to call
+			 * ve2_xrs_request() which will assign a new (valid)
+			 * partition before any AIE operations are attempted.
+			 */
+			nhwctx->mgmtctx = NULL;
+			nhwctx->aie_dev  = NULL;
 
-        mutex_unlock(&mgmtctx->ctx_lock);
+			/*
+			 * Close the shim-side AIE FD so the AIE driver can
+			 * deregister the partition from the aperture.
+			 *
+			 * Two references keep the file alive:
+			 *   1) The open FD entry in the process file table
+			 *   2) The VMA created when the shim called mmap() on
+			 *      the FD to access the AIE registers (XAie init)
+			 *
+			 * close_fd() alone only drops (1).  The VMA holds (2)
+			 * and prevents f_count from reaching 0, so the file's
+			 * release() — which calls put_device() on the partition —
+			 * is never invoked.  Without that, aie_partition_release()
+			 * never reaches refcount=0 and the aperture keeps the
+			 * columns marked "in use".
+			 *
+			 * Solution: force-unmap the VMA first, then close the FD.
+			 * After both steps, f_count==0 → release() fires →
+			 * put_device() → aperture clears the "in use" bitmap.
+			 *
+			 * close_fd() / vm_munmap() only operate on current->mm;
+			 * skip if the owning process is different.
+			 */
+			if (nhwctx->aie_part_fd >= 0 &&
+			    client->pid == task_pid_vnr(current)) {
+				struct file *aie_file = fget(nhwctx->aie_part_fd);
 
-        /* Now forcefully reclaim XRS tracking (this deletes solver_nodes) */
-        mutex_lock(&xrs->xrs_lock);
-        ret = xrs_reclaim_partition(xrs, start_col, ncols, &load_act);
-        mutex_unlock(&xrs->xrs_lock);
+				if (aie_file) {
+					ve2_force_unmap_aie_file(aie_file);
+					fput(aie_file);
+				}
+				XDNA_DBG(xdna,
+					 "reclaim: closing aie_part_fd=%d hwctx id=%u pid=%d",
+					 nhwctx->aie_part_fd, hwctx->id, client->pid);
+				close_fd(nhwctx->aie_part_fd);
+				nhwctx->aie_part_fd = -1;
+			}
+		}
+		srcu_read_unlock(&client->ctx_srcu, idx);
+	}
 
-        if (ret) {
-                XDNA_ERR(xdna, "xrs_reclaim failed ret=%d", ret);
-                return ret;
-        }
+	/* Step 2: Forcefully reclaim XRS tracking (deletes solver nodes) */
+	mutex_lock(&xrs->xrs_lock);
+	ret = xrs_reclaim_partition(xrs, start_col, ncols, &load_act);
+	mutex_unlock(&xrs->xrs_lock);
 
-        /* Actually destroy the AIE partition */
-        ve2_mgmt_destroy_partition(mgmtctx);
+	if (ret) {
+		XDNA_ERR(xdna, "xrs_reclaim failed ret=%d", ret);
+		return ret;
+	}
 
-        return 0;
+	/* Step 3: Destroy the AIE partition – now safe, all FD refs are gone */
+	ve2_mgmt_destroy_partition(mgmtctx);
+
+	return 0;
 }
 
 /**
@@ -1626,16 +1890,28 @@ void ve2_mgmt_destroy_partition(struct amdxdna_mgmtctx  *mgmtctx)
         struct amdxdna_dev *xdna = mgmtctx->xdna;
         struct workqueue_struct *wq = NULL;
 
+        if (IS_ERR_OR_NULL(mgmtctx->mgmt_aiedev)) {
+                pr_warn("amdxdna: partition_destroy [%u,%u) skipped – aiedev is %s\n",
+                        mgmtctx->start_col, mgmtctx->ncol,
+                        mgmtctx->mgmt_aiedev ? "ERR_PTR" : "NULL");
+                return;
+        }
+
         XDNA_DBG(xdna, "partition_destroy: [%u,%u)", mgmtctx->start_col, mgmtctx->ncol);
 
         mutex_lock(&mgmtctx->ctx_lock);
-        /* Update the active context as partition doesn't exists any more */
+        /* Save wq BEFORE clearing it, then cancel pending work outside the lock */
+        wq = mgmtctx->mgmtctx_workq;
         mgmtctx->mgmtctx_workq = NULL;
         mgmtctx->active_ctx = NULL;
-        wq = mgmtctx->mgmtctx_workq;
         mutex_unlock(&mgmtctx->ctx_lock);
 
-        /* Cancel any pending partition work before destroying it */
+        /* Cancel any pending partition work before destroying it.
+         * Must be done outside ctx_lock to avoid deadlock with sched_work
+         * which also acquires ctx_lock. This ensures aie_partition_release()
+         * is only called after all scheduler work referencing this partition
+         * has completed.
+         */
         if (wq) {
                 cancel_work_sync(&mgmtctx->sched_work);
                 destroy_workqueue(wq);
